@@ -491,10 +491,11 @@ class RunSkillTool(RunnableTool):
     execution_mode = "async"
     timeout_seconds = 120.0
 
-    def __init__(self, registry, orchestrator, llm_client):
+    def __init__(self, registry, orchestrator, llm_client, mcp_manager=None):
         self._registry = registry
         self._orchestrator = orchestrator
         self._llm_client = llm_client
+        self._mcp = mcp_manager
 
     def run(self, skill_name: str, inputs_json: str) -> str:
         from skills import SkillEngine
@@ -510,6 +511,8 @@ class RunSkillTool(RunnableTool):
 
         def tool_runner(tool_name, **kwargs):
             tool = self._orchestrator._tools.get(tool_name)
+            if tool is None and self._mcp is not None:
+                tool = self._mcp.get_tool(tool_name)
             if tool is None:
                 raise RuntimeError(f"Unknown tool: {tool_name}")
             return tool.run(**kwargs)
@@ -1483,7 +1486,17 @@ def _build_agent(args) -> tuple[AgentLoop, AgentConfig]:
         history=history,
     )
 
-    run_skill = RunSkillTool(registry, orchestrator, llm_client)
+    mcp_manager = None
+    if args.mcp_config:
+        try:
+            from mcp_client import MCPClientManager, load_mcp_config
+            mcp_config = load_mcp_config(args.mcp_config)
+            mcp_manager = MCPClientManager.from_config(mcp_config)
+            mcp_manager.start()
+        except Exception as exc:
+            print(f"{DIM}MCP: failed to start — {exc}{RESET}")
+
+    run_skill = RunSkillTool(registry, orchestrator, llm_client, mcp_manager=mcp_manager)
     create_skill = CreateSkillTool(registry)
     orchestrator._tools[run_skill.name] = run_skill
     orchestrator._tools[create_skill.name] = create_skill
@@ -1493,16 +1506,6 @@ def _build_agent(args) -> tuple[AgentLoop, AgentConfig]:
         api_key=args.api_key,
         model="qwen3:8b" if args.provider == "vertex-claude" else model,
     )
-
-    mcp_manager = None
-    if args.mcp_config:
-        try:
-            from mcp_client import MCPClientManager, load_mcp_config
-            mcp_config = load_mcp_config(args.mcp_config)
-            mcp_manager = MCPClientManager(mcp_config)
-            mcp_manager.start()
-        except Exception as exc:
-            print(f"{DIM}MCP: failed to start — {exc}{RESET}")
 
     agent = AgentLoop(
         llm_client=llm_client,

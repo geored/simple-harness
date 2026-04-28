@@ -693,6 +693,9 @@ class MCPToolBridge(RunnableTool):
     Routes calls through the owning MCPClient with retry logic.
     """
 
+    execution_mode = "async"
+    timeout_seconds = 30.0
+
     def __init__(self, schema: MCPToolSchema, client: MCPClient, max_retries: int = 2):
         self._schema = schema
         self._client = client
@@ -731,6 +734,16 @@ class MCPToolBridge(RunnableTool):
             except Exception as exc:
                 raise  # Non-transient errors bubble up immediately
         raise last_exc
+
+    def to_openai_schema(self) -> Dict[str, Any]:
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": self.parameters_schema,
+            },
+        }
 
 
 # ─────────────────────────────────────────────────────────────────────────────

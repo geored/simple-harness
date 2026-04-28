@@ -1,0 +1,8 @@
+{
+  "servers": {
+    "test": {
+      "transport": "stdio",
+      "command": ["python3", "test_mcp_server.py"]
+    }
+  }
+}
