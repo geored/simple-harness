@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+memory.md
+session.md
+cortex_memory.json
+*.pt

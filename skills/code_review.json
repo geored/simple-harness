@@ -1,0 +1,19 @@
+{
+  "sequence_id": "code_review",
+  "steps": [
+    {
+      "step_id": "read",
+      "skill": "read_file",
+      "inputs": {
+        "path": "$input.file_path"
+      },
+      "on_error": "abort"
+    },
+    {
+      "step_id": "review",
+      "type": "llm",
+      "prompt": "You are an expert code reviewer. Review the following code from the file '$input.file_path' for:\n1. **Bugs** \u2014 logic errors, off-by-one errors, null/None handling, race conditions\n2. **Style issues** \u2014 naming conventions, formatting, readability\n3. **Improvements** \u2014 performance, maintainability, best practices\n4. **Security** \u2014 any potential vulnerabilities\n\nProvide a clear, organized report with specific line references where possible.\n\nCode:\n```\n$read\n```",
+      "on_error": "abort"
+    }
+  ]
+}

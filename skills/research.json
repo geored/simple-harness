@@ -1,0 +1,21 @@
+{
+  "sequence_id": "research",
+  "description": "Search the web for a topic and summarize findings",
+  "steps": [
+    {
+      "step_id": "search",
+      "skill": "web_search",
+      "inputs": {
+        "query": "$input.topic"
+      },
+      "retry": {"count": 2, "delay_seconds": 1},
+      "on_error": "abort"
+    },
+    {
+      "step_id": "summarize",
+      "type": "llm",
+      "prompt": "Based on these search results, provide a concise summary about $input.topic:\n\n$search",
+      "on_error": "abort"
+    }
+  ]
+}

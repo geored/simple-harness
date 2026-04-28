@@ -1,0 +1,9 @@
+skills:
+- parameters:
+    path:
+      type: string
+  skill_name: list_files
+- parameters:
+    path:
+      type: string
+  skill_name: read_file

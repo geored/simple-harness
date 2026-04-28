@@ -1,0 +1,21 @@
+skills:
+  - name: web_search
+    description: Search the web for a query
+    inputs:
+      - name: query
+        type: string
+        required: true
+    output_schema:
+      type: string
+
+  - name: summarize
+    description: LLM summarizes search results
+    inputs:
+      - name: prompt
+        type: string
+        required: true
+    output_schema:
+      type: dict
+      fields:
+        response:
+          type: string
