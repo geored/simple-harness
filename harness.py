@@ -1049,6 +1049,7 @@ class AgentLoop:
         config: AgentConfig,
         memory: Optional[LivingMemory] = None,
         session: Optional[LivingSession] = None,
+        mcp_manager=None,
     ):
         self._llm = llm_client
         self._orch = orchestrator
@@ -1056,6 +1057,7 @@ class AgentLoop:
         self._config = config
         self._memory = memory
         self._session = session
+        self._mcp = mcp_manager
         # Max agent iterations: respect config but never exceed hard ceiling
         self._max_iterations = min(
             max(self._config.max_retries * 4, 10),
@@ -1081,6 +1083,15 @@ class AgentLoop:
 
         self._orch.submit_user_message(user_prompt)
         tool_schemas = self._orch.tool_schemas()
+
+        if self._mcp is not None:
+            results = self._mcp.search_tools(user_prompt, top_k=5)
+            for r in results:
+                mcp_tool = self._mcp.get_tool(r.tool.qualified_name)
+                if mcp_tool and mcp_tool.name not in self._orch._tools:
+                    self._orch._tools[mcp_tool.name] = mcp_tool
+                    tool_schemas.append(mcp_tool.to_openai_schema())
+                    _spinner_detail[0] = f"+ {r.tool.qualified_name}"
 
         for iteration in range(1, self._max_iterations + 1):
             logger.info("--- Agent iteration %d/%d ---", iteration, self._max_iterations)
@@ -1233,6 +1244,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Vertex AI region. Default: global",
     )
     parser.add_argument(
+        "--mcp-config",
+        default=None,
+        help="Path to MCP server config JSON file. Servers are started and "
+             "tools are discovered automatically.",
+    )
+    parser.add_argument(
         "--demo",
         action="store_true",
         help="Run a built-in demo without calling a real LLM endpoint.",
@@ -1339,6 +1356,12 @@ def repl(agent: AgentLoop, config: AgentConfig) -> None:
     print(_separator())
     print(f"{BOLD}AI Harness{RESET} · {config.model}")
     print(f"{DIM}Tools: {', '.join(agent._orch._tools.keys())}{RESET}")
+    if agent._mcp is not None:
+        mcp_status = agent._mcp.status()
+        servers = mcp_status.get("servers", {})
+        parts = [f"{name} ({s.get('tools', 0)} tools)" for name, s in servers.items() if s.get("alive")]
+        if parts:
+            print(f"{DIM}MCP: {' · '.join(parts)}{RESET}")
     if agent._memory is not None:
         words = len(agent._memory.content.split()) if agent._memory.content else 0
         status = f"{words} words" if words else "empty"
@@ -1394,6 +1417,8 @@ def repl(agent: AgentLoop, config: AgentConfig) -> None:
     agent._orch.shutdown()
     if agent._session is not None:
         agent._session.clear()
+    if agent._mcp is not None:
+        agent._mcp.stop()
 
 
 def _build_agent(args) -> tuple[AgentLoop, AgentConfig]:
@@ -1469,6 +1494,16 @@ def _build_agent(args) -> tuple[AgentLoop, AgentConfig]:
         model="qwen3:8b" if args.provider == "vertex-claude" else model,
     )
 
+    mcp_manager = None
+    if args.mcp_config:
+        try:
+            from mcp_client import MCPClientManager, load_mcp_config
+            mcp_config = load_mcp_config(args.mcp_config)
+            mcp_manager = MCPClientManager(mcp_config)
+            mcp_manager.start()
+        except Exception as exc:
+            print(f"{DIM}MCP: failed to start — {exc}{RESET}")
+
     agent = AgentLoop(
         llm_client=llm_client,
         orchestrator=orchestrator,
@@ -1476,6 +1511,7 @@ def _build_agent(args) -> tuple[AgentLoop, AgentConfig]:
         config=config,
         memory=memory,
         session=session,
+        mcp_manager=mcp_manager,
     )
     return agent, config
 
