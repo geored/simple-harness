@@ -1458,6 +1458,8 @@ def _build_agent(args) -> tuple[AgentLoop, AgentConfig]:
             base_url=args.base_url,
             api_key=args.api_key,
             model="qwen3:8b",
+            vertex_project=project,
+            vertex_region=args.region,
         )
     else:
         llm_client = LLMClient(
@@ -1501,10 +1503,13 @@ def _build_agent(args) -> tuple[AgentLoop, AgentConfig]:
     orchestrator._tools[run_skill.name] = run_skill
     orchestrator._tools[create_skill.name] = create_skill
 
+    vertex_proj = project if args.provider == "vertex-claude" else None
     session = LivingSession(
         base_url=args.base_url,
         api_key=args.api_key,
         model="qwen3:8b" if args.provider == "vertex-claude" else model,
+        vertex_project=vertex_proj,
+        vertex_region=args.region if vertex_proj else "global",
     )
 
     agent = AgentLoop(

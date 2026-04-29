@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -22,7 +23,9 @@ import requests
 logger = logging.getLogger("agent_harness.memory")
 
 MEMORY_FILE = Path("memory.md")
+MEMORY_ARCHIVE = Path("memory_archive.md")
 SESSION_FILE = Path("session.md")
+ARCHIVE_MAX_AGE_DAYS = 90
 
 # ---------------------------------------------------------------------------
 # Base engine — shared by memory and session
@@ -38,6 +41,9 @@ class _LivingDocument:
         api_key: str = "ollama",
         model: str = "qwen3:8b",
         max_words: int = 500,
+        vertex_project: Optional[str] = None,
+        vertex_region: str = "global",
+        vertex_model: str = "claude-sonnet-4-6",
     ):
         self._file = file_path
         self._prompt_template = consolidation_prompt
@@ -46,6 +52,9 @@ class _LivingDocument:
         self._api_key = api_key
         self._model = model
         self._max_words = max_words
+        self._vertex_project = vertex_project
+        self._vertex_region = vertex_region
+        self._vertex_model = vertex_model
         self._content = self._load()
 
     @property
@@ -60,6 +69,9 @@ class _LivingDocument:
     def consolidate(self, conversation: list[dict]) -> None:
         if not conversation:
             return
+
+        self._archive_before_rewrite()
+
         conv_text = self._format_conversation(conversation)
         prompt = self._prompt_template.format(
             max_words=self._max_words,
@@ -72,6 +84,10 @@ class _LivingDocument:
             logger.info("%s consolidated (%d words)", self.__class__.__name__, len(self._content.split()))
         except Exception as exc:
             logger.warning("%s consolidation failed: %s", self.__class__.__name__, exc)
+
+    def _archive_before_rewrite(self) -> None:
+        """Override in subclasses that need archiving."""
+        pass
 
     def clear(self) -> None:
         self._content = ""
@@ -95,6 +111,24 @@ class _LivingDocument:
         return "\n".join(lines)
 
     def _call_llm(self, prompt: str) -> str:
+        if self._vertex_project:
+            try:
+                return self._call_vertex(prompt)
+            except Exception as exc:
+                logger.warning("Vertex consolidation failed, falling back to Ollama: %s", exc)
+        return self._call_ollama(prompt)
+
+    def _call_vertex(self, prompt: str) -> str:
+        from anthropic import AnthropicVertex
+        client = AnthropicVertex(project_id=self._vertex_project, region=self._vertex_region)
+        response = client.messages.create(
+            model=self._vertex_model,
+            max_tokens=1024,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return "".join(b.text for b in response.content if b.type == "text")
+
+    def _call_ollama(self, prompt: str) -> str:
         response = requests.post(
             f"{self._base_url}/chat/completions",
             headers={
@@ -107,7 +141,7 @@ class _LivingDocument:
                 "max_tokens": 1024,
                 "temperature": 0.3,
             },
-            timeout=120,
+            timeout=300,
         )
         response.raise_for_status()
         return response.json()["choices"][0]["message"]["content"]
@@ -132,7 +166,8 @@ class _LivingDocument:
 _MEMORY_PROMPT = """You are maintaining your own persistent memory. Below is your current memory and a conversation that just happened.
 
 Rewrite your memory document. Rules:
-- Keep everything important: names, locations, preferences, decisions, technical facts, corrections
+- ALWAYS preserve identity facts: user's name, location, role, background — these NEVER expire
+- Keep preferences, decisions, technical facts, corrections
 - Update anything that changed (e.g., if the user moved, update their location)
 - Drop noise: greetings, filler, things that don't matter for future conversations
 - Stay under {max_words} words
@@ -151,7 +186,8 @@ UPDATED MEMORY:"""
 
 class LivingMemory(_LivingDocument):
     def __init__(self, base_url="http://localhost:11434/v1", api_key="ollama",
-                 model="qwen3:8b", max_words=500, memory_file=MEMORY_FILE):
+                 model="qwen3:8b", max_words=500, memory_file=MEMORY_FILE,
+                 vertex_project=None, vertex_region="global", vertex_model="claude-sonnet-4-6"):
         super().__init__(
             file_path=memory_file,
             consolidation_prompt=_MEMORY_PROMPT,
@@ -160,7 +196,48 @@ class LivingMemory(_LivingDocument):
                 "(these are facts you KNOW, use them naturally):\n\n"
             ),
             base_url=base_url, api_key=api_key, model=model, max_words=max_words,
+            vertex_project=vertex_project, vertex_region=vertex_region, vertex_model=vertex_model,
         )
+        self._archive_file = MEMORY_ARCHIVE
+        self._trim_archive()
+
+    def _archive_before_rewrite(self) -> None:
+        if not self._content.strip():
+            return
+        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+        entry = f"\n---\n**[{timestamp}]**\n{self._content}\n"
+        with open(self._archive_file, "a", encoding="utf-8") as f:
+            f.write(entry)
+        logger.info("Memory archived before rewrite (%d words)", len(self._content.split()))
+
+    def _trim_archive(self) -> None:
+        if not self._archive_file.exists():
+            return
+        try:
+            raw = self._archive_file.read_text(encoding="utf-8")
+            entries = raw.split("\n---\n")
+            cutoff = datetime.now(timezone.utc).timestamp() - (ARCHIVE_MAX_AGE_DAYS * 86400)
+
+            kept = []
+            for entry in entries:
+                ts_match = __import__("re").search(r"\*\*\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2})\]\*\*", entry)
+                if not ts_match:
+                    if entry.strip():
+                        kept.append(entry)
+                    continue
+                try:
+                    entry_time = datetime.strptime(ts_match.group(1), "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
+                    if entry_time.timestamp() >= cutoff:
+                        kept.append(entry)
+                except ValueError:
+                    kept.append(entry)
+
+            trimmed = len(entries) - len(kept)
+            if trimmed > 0:
+                self._archive_file.write_text("\n---\n".join(kept), encoding="utf-8")
+                logger.info("Archive trimmed: removed %d entries older than %d days", trimmed, ARCHIVE_MAX_AGE_DAYS)
+        except Exception as exc:
+            logger.warning("Archive trim failed: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -189,7 +266,8 @@ UPDATED SESSION SUMMARY:"""
 
 class LivingSession(_LivingDocument):
     def __init__(self, base_url="http://localhost:11434/v1", api_key="ollama",
-                 model="qwen3:8b", max_words=800, session_file=SESSION_FILE):
+                 model="qwen3:8b", max_words=800, session_file=SESSION_FILE,
+                 vertex_project=None, vertex_region="global", vertex_model="claude-sonnet-4-6"):
         super().__init__(
             file_path=session_file,
             consolidation_prompt=_SESSION_PROMPT,
@@ -198,5 +276,6 @@ class LivingSession(_LivingDocument):
                 "(use this to maintain continuity):\n\n"
             ),
             base_url=base_url, api_key=api_key, model=model, max_words=max_words,
+            vertex_project=vertex_project, vertex_region=vertex_region, vertex_model=vertex_model,
         )
         self.clear()
