@@ -251,6 +251,7 @@ class WebSearchTool(RunnableTool):
     def run(self, query: str) -> str:
         from ddgs import DDGS
         logging.getLogger("primp").setLevel(logging.WARNING)
+        logging.getLogger("ddgs").setLevel(logging.WARNING)
         results = DDGS().text(query, max_results=5)
         if not results:
             return f"No results found for '{query}'"
@@ -595,6 +596,55 @@ class CreateSkillTool(RunnableTool):
 
         self._registry.register(skill_name, manifest, sequence)
         return f"Skill '{skill_name}' created and saved to disk."
+
+
+class DelegateTool(RunnableTool):
+    name = "delegate"
+    description = "Delegate a task to a specialist agent. Input: agent_name (str), task (str)."
+    execution_mode = "async"
+    timeout_seconds = 120.0
+
+    def __init__(self, agent_registry):
+        self._agents = agent_registry
+        agents_desc = ", ".join(f"{n} ({a['description']})" for n, a in self._agents.items())
+        self.description = (
+            f"Delegate a task to a specialist agent. Available agents: {agents_desc}. "
+            "Input: agent_name (str), task (str)."
+        )
+
+    def run(self, agent_name: str, task: str) -> str:
+        agent = self._agents.get(agent_name)
+        if agent is None:
+            available = list(self._agents.keys())
+            return f"Agent '{agent_name}' not found. Available: {available}"
+
+        handler = agent.get("handler")
+        if handler is None:
+            return f"Agent '{agent_name}' has no handler"
+
+        _spinner_detail[0] = f"Delegating to {agent_name}"
+        try:
+            result = handler(task)
+            return result if isinstance(result, str) else json.dumps(result, default=str)
+        except Exception as exc:
+            return f"Agent '{agent_name}' failed: {exc}"
+
+
+class ListAgentsTool(RunnableTool):
+    name = "list_agents"
+    description = "List all available specialist agents and their capabilities."
+    execution_mode = "sync"
+    timeout_seconds = 2.0
+
+    def __init__(self, agent_registry):
+        self._agents = agent_registry
+
+    def run(self) -> str:
+        if not self._agents:
+            return "No agents available."
+        lines = [f"- {name}: {a['description']} (model: {a.get('model', '?')})"
+                 for name, a in self._agents.items()]
+        return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -1042,7 +1092,7 @@ class AgentLoop:
 
     # We use max_retries from AgentConfig as the maximum number of LLM turns
     # (not just HTTP retries).  A separate ceiling prevents infinite loops.
-    _HARD_ITERATION_CEILING = 20
+    _HARD_ITERATION_CEILING = 30
 
     def __init__(
         self,
@@ -1062,10 +1112,7 @@ class AgentLoop:
         self._session = session
         self._mcp = mcp_manager
         # Max agent iterations: respect config but never exceed hard ceiling
-        self._max_iterations = min(
-            max(self._config.max_retries * 4, 10),
-            self._HARD_ITERATION_CEILING,
-        )
+        self._max_iterations = self._HARD_ITERATION_CEILING
 
     def run(self, user_prompt: str) -> str:
         """
@@ -1251,6 +1298,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Path to MCP server config JSON file. Servers are started and "
              "tools are discovered automatically.",
+    )
+    parser.add_argument(
+        "--agents",
+        default=None,
+        help="Path to agents config JSON defining specialist sub-agents.",
     )
     parser.add_argument(
         "--demo",
@@ -1502,6 +1554,68 @@ def _build_agent(args) -> tuple[AgentLoop, AgentConfig]:
     create_skill = CreateSkillTool(registry)
     orchestrator._tools[run_skill.name] = run_skill
     orchestrator._tools[create_skill.name] = create_skill
+
+    # Sub-agents
+    if args.agents:
+        try:
+            with open(args.agents) as f:
+                agents_config = json.load(f)
+
+            all_tools_map = {t.name: t for t in [
+                CalculatorTool(), WebSearchTool(), ShellTool(), ReadFileTool(),
+                WriteFileTool(), ListFilesTool(), PythonExecTool(), HttpFetchTool(),
+            ]}
+
+            agent_registry = {}
+            for agent_name, acfg in agents_config.get("agents", {}).items():
+                sub_history = HistoryBackend()
+                sub_tools = [all_tools_map[t] for t in acfg.get("tools", []) if t in all_tools_map]
+                sub_orch = AgentOrchestrator(tools=sub_tools, history=sub_history)
+
+                if acfg.get("provider") == "vertex-claude":
+                    sub_proj = acfg.get("project") or os.environ.get("GOOGLE_CLOUD_PROJECT")
+                    sub_config = AgentConfig(
+                        model=acfg.get("model", "claude-sonnet-4-6"),
+                        max_retries=3, timeout_seconds=60.0,
+                        max_tokens=acfg.get("max_tokens", 4096), temperature=0.7,
+                    )
+                    sub_llm = VertexClaudeClient(project=sub_proj, region=acfg.get("region", "global"), config=sub_config)
+                else:
+                    sub_config = AgentConfig(
+                        model=acfg.get("model", "qwen3:8b"),
+                        max_retries=3, timeout_seconds=60.0,
+                        max_tokens=acfg.get("max_tokens", 4096), temperature=0.7,
+                    )
+                    sub_llm = LLMClient(
+                        base_url=acfg.get("base_url", args.base_url),
+                        api_key=acfg.get("api_key", args.api_key),
+                        config=sub_config,
+                    )
+
+                sub_loop = AgentLoop(
+                    llm_client=sub_llm, orchestrator=sub_orch,
+                    history=sub_history, config=sub_config,
+                )
+
+                def make_handler(loop, hist):
+                    def handler(task):
+                        hist.clear()
+                        return loop.run(task)
+                    return handler
+
+                agent_registry[agent_name] = {
+                    "description": acfg.get("description", ""),
+                    "model": acfg.get("model", ""),
+                    "handler": make_handler(sub_loop, sub_history),
+                }
+
+            delegate_tool = DelegateTool(agent_registry)
+            list_agents_tool = ListAgentsTool(agent_registry)
+            orchestrator._tools[delegate_tool.name] = delegate_tool
+            orchestrator._tools[list_agents_tool.name] = list_agents_tool
+            print(f"{DIM}Agents: {', '.join(agent_registry.keys())}{RESET}")
+        except Exception as exc:
+            print(f"{DIM}Agents: failed to load — {exc}{RESET}")
 
     vertex_proj = project if args.provider == "vertex-claude" else None
     session = LivingSession(

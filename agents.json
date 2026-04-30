@@ -1,0 +1,16 @@
+{
+  "agents": {
+    "researcher": {
+      "description": "Searches the web and summarizes findings on any topic",
+      "provider": "openai",
+      "model": "qwen3:8b",
+      "tools": ["web_search", "http_fetch"]
+    },
+    "coder": {
+      "description": "Writes, reviews, and executes Python code",
+      "provider": "openai",
+      "model": "qwen3:8b",
+      "tools": ["read_file", "write_file", "python_exec", "calculator"]
+    }
+  }
+}
