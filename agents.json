@@ -1,16 +1,22 @@
 {
-  "agents": {
-    "researcher": {
-      "description": "Searches the web and summarizes findings on any topic",
-      "provider": "openai",
-      "model": "qwen3:8b",
-      "tools": ["web_search", "http_fetch"]
-    },
-    "coder": {
-      "description": "Writes, reviews, and executes Python code",
-      "provider": "openai",
-      "model": "qwen3:8b",
-      "tools": ["read_file", "write_file", "python_exec", "calculator"]
+    "agents": {
+      "architect": {
+        "description": "Designs system architecture and file structure",
+        "provider": "vertex-claude",
+        "model": "claude-sonnet-4-6",
+        "tools": ["read_file", "write_file", "list_files"]
+      },
+      "coder": {
+        "description": "Writes Python code and tests",
+        "provider": "vertex-claude",
+        "model": "claude-sonnet-4-6",
+        "tools": ["read_file", "write_file", "python_exec", "shell"]
+      },
+      "researcher": {
+        "description": "Searches web for APIs, docs, and examples",
+        "provider": "openai",
+        "model": "qwen3:8b",
+        "tools": ["web_search", "http_fetch"]
+      }
     }
   }
-}

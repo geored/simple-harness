@@ -490,7 +490,7 @@ class RunSkillTool(RunnableTool):
         "JSON object with the skill's required inputs."
     )
     execution_mode = "async"
-    timeout_seconds = 120.0
+    timeout_seconds = 600.0
 
     def __init__(self, registry, orchestrator, llm_client, mcp_manager=None):
         self._registry = registry
@@ -602,7 +602,7 @@ class DelegateTool(RunnableTool):
     name = "delegate"
     description = "Delegate a task to a specialist agent. Input: agent_name (str), task (str)."
     execution_mode = "async"
-    timeout_seconds = 120.0
+    timeout_seconds = 600.0
 
     def __init__(self, agent_registry):
         self._agents = agent_registry
@@ -623,10 +623,15 @@ class DelegateTool(RunnableTool):
             return f"Agent '{agent_name}' has no handler"
 
         _spinner_detail[0] = f"Delegating to {agent_name}"
+        _set_agent_status(agent_name, "working...")
         try:
             result = handler(task)
+            _set_agent_status(agent_name, "done")
+            time.sleep(0.2)
+            _clear_agent_status(agent_name)
             return result if isinstance(result, str) else json.dumps(result, default=str)
         except Exception as exc:
+            _clear_agent_status(agent_name)
             return f"Agent '{agent_name}' failed: {exc}"
 
 
@@ -1103,10 +1108,12 @@ class AgentLoop:
         memory: Optional[LivingMemory] = None,
         session: Optional[LivingSession] = None,
         mcp_manager=None,
+        agent_name: Optional[str] = None,
     ):
         self._llm = llm_client
         self._orch = orchestrator
         self._history = history
+        self._agent_name = agent_name
         self._config = config
         self._memory = memory
         self._session = session
@@ -1166,7 +1173,10 @@ class AgentLoop:
                     "tool_calls": tc["_raw_tool_calls"],
                 })
 
-                _spinner_detail[0] = f"Running {tool_name}"
+                if self._agent_name:
+                    _set_agent_status(self._agent_name, f"{tool_name}")
+                else:
+                    _spinner_detail[0] = f"Running {tool_name}"
                 logger.info(
                     "Executing tool '%s' with args: %s", tool_name, arguments
                 )
@@ -1181,7 +1191,10 @@ class AgentLoop:
                         "Tool '%s' failed: %s", tool_name, result.error
                     )
 
-                _spinner_detail[0] = ""
+                if self._agent_name:
+                    _set_agent_status(self._agent_name, "thinking...")
+                else:
+                    _spinner_detail[0] = ""
                 continue
 
             # ----------------------------------------------------------------
@@ -1369,10 +1382,28 @@ def _separator():
 
 
 _spinner_detail = [""]
+_agent_status = {}
+_agent_status_lock = threading.Lock()
+
+GREEN_FG = "\033[32m"
+YELLOW_FG = "\033[33m"
+UP_LINE = "\033[A"
+
+
+def _set_agent_status(name: str, status: str):
+    with _agent_status_lock:
+        _agent_status[name] = status
+
+
+def _clear_agent_status(name: str):
+    with _agent_status_lock:
+        _agent_status.pop(name, None)
 
 
 def _run_with_spinner(fn, label="Thinking"):
     _spinner_detail[0] = ""
+    with _agent_status_lock:
+        _agent_status.clear()
     result_box = [None, None]
 
     def worker():
@@ -1386,20 +1417,44 @@ def _run_with_spinner(fn, label="Thinking"):
     start = time.time()
     frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
     idx = 0
+    prev_lines = 0
+
     while t.is_alive():
         elapsed = int(time.time() - start)
         frame = frames[idx % len(frames)]
         detail = _spinner_detail[0]
-        line = f"{MAGENTA}{frame}{RESET} {DIM}{label}"
+
+        # Clear previous multi-line output
+        if prev_lines > 0:
+            sys.stdout.write(f"{CLEAR_LINE}")
+            for _ in range(prev_lines):
+                sys.stdout.write(f"{UP_LINE}{CLEAR_LINE}")
+
+        # Main line
+        main = f"{MAGENTA}{frame}{RESET} {DIM}{label}"
         if detail:
-            line += f" · {detail}"
-        line += f" · {elapsed}s{RESET}"
-        sys.stdout.write(f"{CLEAR_LINE}{line}")
+            main += f" · {detail}"
+        main += f" · {elapsed}s{RESET}"
+        sys.stdout.write(main)
+
+        # Agent status lines
+        with _agent_status_lock:
+            agents = dict(_agent_status)
+
+        line_count = 0
+        for name, status in agents.items():
+            sys.stdout.write(f"\n  {GREEN_FG}●{RESET} {DIM}{name:12s} · {status}{RESET}")
+            line_count += 1
+
         sys.stdout.flush()
+        prev_lines = line_count
         idx += 1
         t.join(timeout=0.1)
 
+    # Clear all lines
     sys.stdout.write(CLEAR_LINE)
+    for _ in range(prev_lines):
+        sys.stdout.write(f"{UP_LINE}{CLEAR_LINE}")
     sys.stdout.flush()
 
     if result_box[1]:
@@ -1595,6 +1650,7 @@ def _build_agent(args) -> tuple[AgentLoop, AgentConfig]:
                 sub_loop = AgentLoop(
                     llm_client=sub_llm, orchestrator=sub_orch,
                     history=sub_history, config=sub_config,
+                    agent_name=agent_name,
                 )
 
                 def make_handler(loop, hist):
