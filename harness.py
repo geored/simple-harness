@@ -348,7 +348,15 @@ class WriteFileTool(RunnableTool):
     execution_mode = "sync"
     timeout_seconds = 5.0
 
-    def run(self, path: str, content: str) -> str:
+    def run(self, path: str = "", content: str = "", **kwargs) -> str:
+        if not path:
+            path = kwargs.get("filename", kwargs.get("file_path", kwargs.get("name", "")))
+        if not content:
+            content = kwargs.get("code", kwargs.get("text", kwargs.get("data", "")))
+        if not path:
+            return "Error: 'path' parameter is required"
+        if not content:
+            return "Error: 'content' parameter is required — provide the text to write"
         try:
             safe = _safe_path(path)
             safe.parent.mkdir(parents=True, exist_ok=True)
@@ -498,7 +506,11 @@ class RunSkillTool(RunnableTool):
         self._llm_client = llm_client
         self._mcp = mcp_manager
 
-    def run(self, skill_name: str, inputs_json: str) -> str:
+    def run(self, skill_name: str = "", inputs_json: str = "", **kwargs) -> str:
+        skill_name = skill_name or kwargs.get("name", kwargs.get("skill", ""))
+        inputs_json = inputs_json or kwargs.get("inputs", kwargs.get("params", ""))
+        if not skill_name:
+            return "Error: 'skill_name' parameter is required"
         from skills import SkillEngine
         skill_data = self._registry.get(skill_name)
         if skill_data is None:
@@ -586,7 +598,14 @@ class CreateSkillTool(RunnableTool):
     def __init__(self, registry):
         self._registry = registry
 
-    def run(self, skill_name: str, manifest_yaml: str, sequence_json: str) -> str:
+    def run(self, skill_name: str = "", manifest_yaml: str = "", sequence_json: str = "", **kwargs) -> str:
+        skill_name = skill_name or kwargs.get("name", kwargs.get("skill", ""))
+        manifest_yaml = manifest_yaml or kwargs.get("manifest", kwargs.get("yaml", ""))
+        sequence_json = sequence_json or kwargs.get("sequence", kwargs.get("json", kwargs.get("steps", "")))
+        if not skill_name:
+            return "Error: 'skill_name' parameter is required"
+        if not manifest_yaml or not sequence_json:
+            return "Error: both 'manifest_yaml' and 'sequence_json' parameters are required"
         import yaml as _yaml
         try:
             manifest = _yaml.safe_load(manifest_yaml)
@@ -612,7 +631,13 @@ class DelegateTool(RunnableTool):
             "Input: agent_name (str), task (str)."
         )
 
-    def run(self, agent_name: str, task: str) -> str:
+    def run(self, agent_name: str = "", task: str = "", **kwargs) -> str:
+        agent_name = agent_name or kwargs.get("name", kwargs.get("agent", ""))
+        task = task or kwargs.get("prompt", kwargs.get("message", kwargs.get("content", "")))
+        if not agent_name:
+            return "Error: 'agent_name' parameter is required"
+        if not task:
+            return "Error: 'task' parameter is required"
         agent = self._agents.get(agent_name)
         if agent is None:
             available = list(self._agents.keys())
@@ -1289,6 +1314,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Per-request HTTP timeout in seconds. Default: 60.0",
     )
     parser.add_argument(
+        "--workspace",
+        default=None,
+        help="Working directory for file operations. Creates it if needed. Default: current directory.",
+    )
+    parser.add_argument(
         "--provider",
         default="openai",
         choices=["openai", "vertex-claude"],
@@ -1419,42 +1449,51 @@ def _run_with_spinner(fn, label="Thinking"):
     idx = 0
     prev_lines = 0
 
+    cols = shutil.get_terminal_size().columns
+
     while t.is_alive():
         elapsed = int(time.time() - start)
         frame = frames[idx % len(frames)]
         detail = _spinner_detail[0]
 
-        # Clear previous multi-line output
-        if prev_lines > 0:
-            sys.stdout.write(f"{CLEAR_LINE}")
-            for _ in range(prev_lines):
-                sys.stdout.write(f"{UP_LINE}{CLEAR_LINE}")
-
-        # Main line
-        main = f"{MAGENTA}{frame}{RESET} {DIM}{label}"
+        # Build main line
+        main = f"{frame} {label}"
         if detail:
             main += f" · {detail}"
-        main += f" · {elapsed}s{RESET}"
-        sys.stdout.write(main)
+        main += f" · {elapsed}s"
 
         # Agent status lines
         with _agent_status_lock:
             agents = dict(_agent_status)
 
-        line_count = 0
+        agent_lines = []
         for name, status in agents.items():
-            sys.stdout.write(f"\n  {GREEN_FG}●{RESET} {DIM}{name:12s} · {status}{RESET}")
-            line_count += 1
+            agent_lines.append(f"  ● {name:12s} · {status}")
+
+        # Clear previous output: move up and clear each line
+        if prev_lines > 0:
+            for _ in range(prev_lines):
+                sys.stdout.write(f"\033[A\033[2K")
+        sys.stdout.write(f"\r\033[2K")
+
+        # Write new output
+        padded = main.ljust(cols)[:cols]
+        sys.stdout.write(f"\r{MAGENTA}{padded}{RESET}")
+
+        for al in agent_lines:
+            padded_al = al.ljust(cols)[:cols]
+            sys.stdout.write(f"\n{GREEN_FG}{padded_al}{RESET}")
 
         sys.stdout.flush()
-        prev_lines = line_count
+        prev_lines = len(agent_lines)
         idx += 1
         t.join(timeout=0.1)
 
-    # Clear all lines
-    sys.stdout.write(CLEAR_LINE)
-    for _ in range(prev_lines):
-        sys.stdout.write(f"{UP_LINE}{CLEAR_LINE}")
+    # Final cleanup
+    if prev_lines > 0:
+        for _ in range(prev_lines):
+            sys.stdout.write(f"\033[A\033[2K")
+    sys.stdout.write(f"\r\033[2K")
     sys.stdout.flush()
 
     if result_box[1]:
@@ -1631,14 +1670,14 @@ def _build_agent(args) -> tuple[AgentLoop, AgentConfig]:
                     sub_proj = acfg.get("project") or os.environ.get("GOOGLE_CLOUD_PROJECT")
                     sub_config = AgentConfig(
                         model=acfg.get("model", "claude-sonnet-4-6"),
-                        max_retries=3, timeout_seconds=60.0,
+                        max_retries=3, timeout_seconds=300.0,
                         max_tokens=acfg.get("max_tokens", 4096), temperature=0.7,
                     )
                     sub_llm = VertexClaudeClient(project=sub_proj, region=acfg.get("region", "global"), config=sub_config)
                 else:
                     sub_config = AgentConfig(
                         model=acfg.get("model", "qwen3:8b"),
-                        max_retries=3, timeout_seconds=60.0,
+                        max_retries=3, timeout_seconds=300.0,
                         max_tokens=acfg.get("max_tokens", 4096), temperature=0.7,
                     )
                     sub_llm = LLMClient(
@@ -1656,6 +1695,14 @@ def _build_agent(args) -> tuple[AgentLoop, AgentConfig]:
                 def make_handler(loop, hist):
                     def handler(task):
                         hist.clear()
+                        hist.append({
+                            "role": "system",
+                            "content": (
+                                "You are a specialist agent. Complete the task using your tools. "
+                                "When done, respond with a TEXT SUMMARY of what you did. "
+                                "Do NOT keep calling tools indefinitely — finish and report back."
+                            ),
+                        })
                         return loop.run(task)
                     return handler
 
@@ -1701,9 +1748,18 @@ def main():
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
     else:
-        logging.getLogger("agent_harness").setLevel(logging.WARNING)
+        logging.getLogger("agent_harness").setLevel(logging.ERROR)
         logging.getLogger("httpx").setLevel(logging.WARNING)
         logging.getLogger("anthropic").setLevel(logging.WARNING)
+
+    if args.workspace:
+        import pathlib
+        ws = pathlib.Path(args.workspace).resolve()
+        ws.mkdir(parents=True, exist_ok=True)
+        os.chdir(ws)
+        global _WORKSPACE
+        _WORKSPACE = ws
+        print(f"{DIM}Workspace: {ws}{RESET}")
 
     if args.demo:
         run_demo()
