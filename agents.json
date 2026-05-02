@@ -14,8 +14,8 @@
       },
       "researcher": {
         "description": "Searches web for APIs, docs, and examples",
-        "provider": "openai",
-        "model": "qwen3:8b",
+        "provider": "vertex-claude",
+        "model": "claude-sonnet-4-6",
         "tools": ["web_search", "http_fetch"]
       }
     }

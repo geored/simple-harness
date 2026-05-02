@@ -6,3 +6,8 @@ memory_archive.md
 session.md
 cortex_memory.json
 *.pt
+*.db
+price_monitor/
+tests/
+requirements.txt
+README.md
