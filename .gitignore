@@ -8,6 +8,10 @@ cortex_memory.json
 *.pt
 *.db
 price_monitor/
+url_shortener/
+telegram_bot/
 tests/
 requirements.txt
 README.md
+DESIGN.md
+run.py
