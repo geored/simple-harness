@@ -4,6 +4,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import shutil
 import sys
 import threading
@@ -493,71 +494,56 @@ class HttpFetchTool(RunnableTool):
 class RunSkillTool(RunnableTool):
     name = "run_skill"
     description = (
-        "Execute a multi-step skill by name. Available skills can be listed "
-        "with list_skills. Input: skill_name (str), inputs_json (str) — "
-        "JSON object with the skill's required inputs."
+        "Activate a skill to guide your next actions. "
+        "The skill provides expert instructions for a specific task. "
+        "Input: skill_name (str), context (str) — optional additional context."
     )
-    execution_mode = "async"
-    timeout_seconds = 600.0
+    execution_mode = "sync"
+    timeout_seconds = 5.0
 
-    def __init__(self, registry, orchestrator, llm_client, mcp_manager=None):
+    def __init__(self, registry, mcp_manager=None):
         self._registry = registry
-        self._orchestrator = orchestrator
-        self._llm_client = llm_client
         self._mcp = mcp_manager
+        self._activated = set()
 
-    def run(self, skill_name: str = "", inputs_json: str = "", **kwargs) -> str:
+    def run(self, skill_name: str = "", context: str = "", **kwargs) -> str:
         skill_name = skill_name or kwargs.get("name", kwargs.get("skill", ""))
-        inputs_json = inputs_json or kwargs.get("inputs", kwargs.get("params", ""))
+        context = context or kwargs.get("task", kwargs.get("input", kwargs.get("inputs_json", "")))
         if not skill_name:
             return "Error: 'skill_name' parameter is required"
-        from skills import SkillEngine
-        skill_data = self._registry.get(skill_name)
-        if skill_data is None:
+
+        skill = self._registry.get(skill_name)
+        if not skill:
             available = [s["name"] for s in self._registry.list_skills()]
             return f"Skill '{skill_name}' not found. Available: {available}"
 
-        try:
-            inputs = json.loads(inputs_json) if inputs_json else {}
-        except json.JSONDecodeError:
-            return f"Invalid JSON for inputs: {inputs_json}"
+        if skill_name in self._activated:
+            return f"Skill '{skill_name}' is already active. Follow the instructions previously provided."
 
-        def tool_runner(tool_name, **kwargs):
-            tool = self._orchestrator._tools.get(tool_name)
-            if tool is None and self._mcp is not None:
-                tool = self._mcp.get_tool(tool_name)
-            if tool is None:
-                raise RuntimeError(f"Unknown tool: {tool_name}")
-            return tool.run(**kwargs)
+        mcp_servers = skill.get("metadata", {}).get("mcp-servers", "")
+        if mcp_servers and self._mcp:
+            status = self._mcp.status()
+            servers = status.get("servers", {})
+            missing = [s for s in mcp_servers.split() if s not in servers or not servers[s].get("alive")]
+            if missing:
+                return f"Skill requires MCP servers not connected: {missing}"
 
-        def llm_runner(prompt):
-            messages = [{"role": "user", "content": prompt}]
-            response = self._llm_client.chat(messages=messages)
-            return response.text or ""
+        content = self._registry.load_skill(skill_name)
+        if not content:
+            return f"Could not load skill '{skill_name}'"
 
-        def on_step(num, total, step_id, label):
-            _spinner_detail[0] = f"Step {num}/{total} · {label}"
+        self._activated.add(skill_name)
 
-        engine = SkillEngine(
-            manifest=skill_data["manifest"],
-            sequence=skill_data["sequence"],
-            tool_runner=tool_runner,
-            llm_runner=llm_runner,
-            on_step=on_step,
-        )
-
-        try:
-            state = engine.run(initial_inputs=inputs)
-            sys.stdout.write(CLEAR_LINE)
-            sys.stdout.flush()
-            last_step = list(state.steps.values())[-1] if state.steps else None
-            if last_step:
-                return json.dumps(last_step.output, default=str)
-            return "Skill completed with no output"
-        except Exception as exc:
-            sys.stdout.write(CLEAR_LINE)
-            sys.stdout.flush()
-            return f"Skill '{skill_name}' failed: {exc}"
+        result = f"=== SKILL: {skill_name} ===\n\n"
+        result += "[SKILL_INSTRUCTIONS_START]\n"
+        result += content
+        result += "\n[SKILL_INSTRUCTIONS_END]\n"
+        if skill.get("allowed_tools"):
+            result += f"\nApproved tools for this skill: {skill['allowed_tools']}"
+        if context:
+            result += f"\n\nUser context: {context}"
+        result += "\n\nFollow these instructions now using the approved tools."
+        return result
 
 
 class ListSkillsTool(RunnableTool):
@@ -580,41 +566,43 @@ class ListSkillsTool(RunnableTool):
 class CreateSkillTool(RunnableTool):
     name = "create_skill"
     description = (
-        "Create a new reusable multi-step skill. Inputs: skill_name (str), "
-        "manifest_yaml (str) — YAML with skills list defining tool schemas, "
-        "sequence_json (str) — JSON execution sequence. "
-        "Steps reference prior outputs with $step_id or $step_id.field. "
-        "Inputs from the caller use $input.field_name. "
-        "Steps can be tool calls (skill: tool_name, inputs: {...}) or "
-        "LLM calls (type: llm, prompt: text with $refs). "
-        "Example sequence: {\"sequence_id\": \"my_skill\", \"steps\": ["
-        "{\"step_id\": \"s1\", \"skill\": \"read_file\", \"inputs\": {\"path\": \"$input.file_path\"}, "
-        "\"retry\": {\"count\": 1, \"delay_seconds\": 0}, \"on_error\": \"abort\"}, "
-        "{\"step_id\": \"s2\", \"type\": \"llm\", \"prompt\": \"Analyze: $s1\", \"on_error\": \"abort\"}]}"
+        "Create a new reusable skill (agentskills.io format). "
+        "Input: skill_name (str) — lowercase with hyphens only, "
+        "description (str) — what the skill does and when to use it, "
+        "instructions (str) — markdown instructions for the agent to follow."
     )
     execution_mode = "sync"
     timeout_seconds = 5.0
 
+    _NAME_PATTERN = re.compile(r'^[a-z0-9]([a-z0-9-]*[a-z0-9])?$')
+
     def __init__(self, registry):
         self._registry = registry
 
-    def run(self, skill_name: str = "", manifest_yaml: str = "", sequence_json: str = "", **kwargs) -> str:
+    def run(self, skill_name: str = "", description: str = "", instructions: str = "", **kwargs) -> str:
         skill_name = skill_name or kwargs.get("name", kwargs.get("skill", ""))
-        manifest_yaml = manifest_yaml or kwargs.get("manifest", kwargs.get("yaml", ""))
-        sequence_json = sequence_json or kwargs.get("sequence", kwargs.get("json", kwargs.get("steps", "")))
+        description = description or kwargs.get("desc", "")
+        instructions = instructions or kwargs.get("body", kwargs.get("content", kwargs.get("manifest_yaml", "")))
         if not skill_name:
-            return "Error: 'skill_name' parameter is required"
-        if not manifest_yaml or not sequence_json:
-            return "Error: both 'manifest_yaml' and 'sequence_json' parameters are required"
-        import yaml as _yaml
-        try:
-            manifest = _yaml.safe_load(manifest_yaml)
-            sequence = json.loads(sequence_json)
-        except Exception as exc:
-            return f"Invalid skill definition: {exc}"
+            return "Error: 'skill_name' is required (lowercase, hyphens only)"
+        if not description:
+            return "Error: 'description' is required"
+        if not instructions:
+            return "Error: 'instructions' is required"
 
-        self._registry.register(skill_name, manifest, sequence)
-        return f"Skill '{skill_name}' created and saved to disk."
+        if len(skill_name) > 64 or not self._NAME_PATTERN.match(skill_name) or '--' in skill_name:
+            return f"Error: invalid skill name '{skill_name}'. Must be 1-64 chars, lowercase alphanumeric + hyphens."
+
+        import yaml
+        frontmatter = yaml.dump({
+            "name": skill_name,
+            "description": description,
+            "metadata": {"author": "ai-generated", "version": "1.0"},
+        }, default_flow_style=False, allow_unicode=True)
+
+        content = f"---\n{frontmatter}---\n\n{instructions}\n"
+        self._registry.create_from_content(skill_name, content)
+        return f"Skill '{skill_name}' created at skills/{skill_name}/SKILL.md"
 
 
 PLANNING_PROMPT = """You are a project planner. Given a task, decide what specialist agents are needed and create an execution plan.
@@ -1691,7 +1679,7 @@ def _run_with_spinner(fn, label="Thinking"):
     return result_box[0]
 
 
-def repl(agent: AgentLoop, config: AgentConfig) -> None:
+def repl(agent: AgentLoop, config: AgentConfig, registry=None) -> None:
     print(_separator())
     print(f"{BOLD}AI Harness{RESET} · {config.model}")
     print(f"{DIM}Tools: {', '.join(agent._orch._tools.keys())}{RESET}")
@@ -1741,6 +1729,29 @@ def repl(agent: AgentLoop, config: AgentConfig) -> None:
         if prompt.lower() in ("exit", "quit", "/exit", "/quit"):
             print(f"{DIM}Goodbye.{RESET}")
             break
+
+        # Slash command: /skill-name activates a skill directly
+        if prompt.startswith("/") and not prompt.startswith("//"):
+            skill_name = prompt.lstrip("/").strip()
+            from skills import SkillRegistry as _SR
+            if skill_name in registry:
+                content = registry.load_skill(skill_name)
+                if content:
+                    agent._history.clear()
+                    agent._history.append({"role": "user", "content": f"Activate and follow this skill:\n\n{content}"})
+                    print()
+                    try:
+                        answer = _run_with_spinner(lambda: agent.run("Follow the skill instructions."))
+                    except RuntimeError as exc:
+                        print(f"\n{BOLD}Error:{RESET} {exc}\n")
+                        continue
+                    print()
+                    _console.print(Markdown(answer))
+                    print()
+                    continue
+                else:
+                    print(f"{DIM}Skill '{skill_name}' could not be loaded.{RESET}")
+                    continue
 
         agent._history.clear()
         print()
@@ -1834,7 +1845,7 @@ def _build_agent(args) -> tuple[AgentLoop, AgentConfig]:
         except Exception as exc:
             print(f"{DIM}MCP: failed to start — {exc}{RESET}")
 
-    run_skill = RunSkillTool(registry, orchestrator, llm_client, mcp_manager=mcp_manager)
+    run_skill = RunSkillTool(registry, mcp_manager=mcp_manager)
     create_skill = CreateSkillTool(registry)
     orchestrator._tools[run_skill.name] = run_skill
     orchestrator._tools[create_skill.name] = create_skill
@@ -1898,7 +1909,7 @@ def _build_agent(args) -> tuple[AgentLoop, AgentConfig]:
         session=session,
         mcp_manager=mcp_manager,
     )
-    return agent, config
+    return agent, config, registry
 
 
 def main():
@@ -1925,7 +1936,7 @@ def main():
         run_demo()
         return
 
-    agent, config = _build_agent(args)
+    agent, config, registry = _build_agent(args)
 
     if args.prompt:
         print(f"\n{BOLD}User:{RESET} {args.prompt}\n")
@@ -1941,7 +1952,7 @@ def main():
             agent._orch.shutdown()
         _console.print(Markdown(answer))
     else:
-        repl(agent, config)
+        repl(agent, config, registry)
 
 
 if __name__ == "__main__":
