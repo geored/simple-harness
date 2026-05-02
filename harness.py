@@ -617,6 +617,196 @@ class CreateSkillTool(RunnableTool):
         return f"Skill '{skill_name}' created and saved to disk."
 
 
+PLANNING_PROMPT = """You are a project planner. Given a task, decide what specialist agents are needed and create an execution plan.
+
+AVAILABLE TOOLS that agents can use:
+calculator, web_search, shell, read_file, write_file, list_files, python_exec, http_fetch
+
+AVAILABLE MODELS:
+- "qwen3:8b" — local, fast, free. Good for: research, search, simple formatting
+- "claude-sonnet-4-6" — capable, moderate cost. Good for: code generation, architecture, complex tasks
+
+RULES:
+- If the task is simple (single question, one tool needed), respond with: {{"agents": [], "plan": []}}
+- Maximum 5 agents, maximum 10 plan steps
+- Each agent needs: name (short, lowercase), role (what it does), tools (from available list), model
+- Plan steps execute sequentially — each step gets context from all previous steps
+- Respond with ONLY valid JSON, nothing else
+
+EXAMPLE for "Build a web scraper with tests":
+{{"agents": [{{"name": "coder", "role": "Write Python code", "tools": ["read_file", "write_file", "python_exec"], "model": "claude-sonnet-4-6"}}, {{"name": "tester", "role": "Write and run tests", "tools": ["read_file", "write_file", "python_exec"], "model": "claude-sonnet-4-6"}}], "plan": [{{"step": 1, "agent": "coder", "task": "Implement the web scraper with requests and BeautifulSoup"}}, {{"step": 2, "agent": "tester", "task": "Write unit tests for the scraper"}}]}}
+
+EXAMPLE for "What is 2+2?":
+{{"agents": [], "plan": []}}
+
+TASK: {task}
+
+JSON:"""
+
+
+def _create_agent_from_spec(spec, provider_config, tool_pool):
+    sub_history = HistoryBackend()
+    sub_tools = [tool_pool[t] for t in spec.get("tools", []) if t in tool_pool]
+    sub_orch = AgentOrchestrator(tools=sub_tools, history=sub_history)
+
+    model = spec.get("model", "qwen3:8b")
+
+    if model.startswith("claude-") and provider_config.get("vertex_project"):
+        sub_config = AgentConfig(
+            model=model, max_retries=3, timeout_seconds=300.0,
+            max_tokens=spec.get("max_tokens", 4096), temperature=0.7,
+        )
+        sub_llm = VertexClaudeClient(
+            project=provider_config["vertex_project"],
+            region=provider_config.get("vertex_region", "global"),
+            config=sub_config,
+        )
+    else:
+        if model.startswith("claude-"):
+            model = "qwen3:8b"
+        sub_config = AgentConfig(
+            model=model, max_retries=3, timeout_seconds=300.0,
+            max_tokens=spec.get("max_tokens", 4096), temperature=0.7,
+        )
+        sub_llm = LLMClient(
+            base_url=provider_config.get("base_url", "http://localhost:11434/v1"),
+            api_key=provider_config.get("api_key", "ollama"),
+            config=sub_config,
+        )
+
+    agent_name = spec["name"]
+    sub_loop = AgentLoop(
+        llm_client=sub_llm, orchestrator=sub_orch,
+        history=sub_history, config=sub_config,
+        agent_name=agent_name,
+    )
+
+    def handler(task, _loop=sub_loop, _hist=sub_history):
+        _hist.clear()
+        _hist.append({
+            "role": "system",
+            "content": (
+                "You are a specialist agent. Complete the task using your tools. "
+                "When done, respond with a TEXT SUMMARY of what you did. "
+                "Do NOT keep calling tools indefinitely — finish and report back."
+            ),
+        })
+        return _loop.run(task)
+
+    return {
+        "description": spec.get("role", ""),
+        "model": model,
+        "handler": handler,
+        "orchestrator": sub_orch,
+    }
+
+
+class PlanAgentsTool(RunnableTool):
+    name = "plan_agents"
+    description = (
+        "Analyze a complex task and create specialist agents to handle it. "
+        "Call this FIRST on tasks that need multiple steps or expertise areas. "
+        "Input: task_description (str) — the user's full request."
+    )
+    execution_mode = "async"
+    timeout_seconds = 120.0
+
+    def __init__(self, provider_config, tool_pool, agent_registry):
+        self._provider_config = provider_config
+        self._tool_pool = tool_pool
+        self._agents = agent_registry
+        self._planner_llm = self._build_planner()
+
+    def _build_planner(self):
+        pc = self._provider_config
+        if pc.get("vertex_project"):
+            try:
+                config = AgentConfig(model="claude-opus-4-6", max_retries=2,
+                                     timeout_seconds=60.0, max_tokens=2048, temperature=0.3)
+                return VertexClaudeClient(
+                    project=pc["vertex_project"],
+                    region=pc.get("vertex_region", "global"),
+                    config=config,
+                )
+            except Exception:
+                pass
+        config = AgentConfig(model=pc.get("model", "qwen3:8b"), max_retries=2,
+                             timeout_seconds=60.0, max_tokens=2048, temperature=0.3)
+        return LLMClient(
+            base_url=pc.get("base_url", "http://localhost:11434/v1"),
+            api_key=pc.get("api_key", "ollama"),
+            config=config,
+        )
+
+    def run(self, task_description: str = "", **kwargs) -> str:
+        task_description = task_description or kwargs.get("task", kwargs.get("prompt", ""))
+        if not task_description:
+            return "Error: 'task_description' parameter is required"
+
+        _spinner_detail[0] = "Planning agents (Opus)"
+
+        prompt = PLANNING_PROMPT.format(task=task_description)
+        plan = None
+
+        for attempt in range(2):
+            try:
+                response = self._planner_llm.chat(
+                    messages=[{"role": "user", "content": prompt}]
+                )
+                text = response.text or ""
+                text = text.strip()
+                if text.startswith("```"):
+                    text = text.split("\n", 1)[1].rsplit("```", 1)[0]
+                plan = json.loads(text)
+                break
+            except (json.JSONDecodeError, RuntimeError) as exc:
+                if attempt == 0:
+                    prompt += "\n\nYour previous response was not valid JSON. Respond with ONLY JSON."
+                    continue
+                return f"Planning failed: {exc}. Handle the task directly with your own tools."
+
+        agents_spec = plan.get("agents", [])
+        steps = plan.get("plan", [])
+
+        if not agents_spec:
+            return "No specialist agents needed — handle this task directly with your tools."
+
+        if len(agents_spec) > 5:
+            agents_spec = agents_spec[:5]
+        if len(steps) > 10:
+            steps = steps[:10]
+
+        _spinner_detail[0] = "Creating agents"
+
+        created = []
+        for spec in agents_spec:
+            name = spec.get("name", "")
+            if not name or name in self._agents:
+                continue
+            try:
+                agent_entry = _create_agent_from_spec(spec, self._provider_config, self._tool_pool)
+                self._agents[name] = agent_entry
+                created.append(f"{name} ({spec.get('role', '')})")
+            except Exception as exc:
+                logger.warning("Failed to create agent '%s': %s", name, exc)
+
+        if not created:
+            return "Could not create any agents. Handle the task directly with your tools."
+
+        _spinner_detail[0] = f"Created: {', '.join(c.split(' (')[0] for c in created)}"
+
+        plan_text = f"Created {len(created)} specialist agents:\n"
+        for c in created:
+            plan_text += f"  - {c}\n"
+        plan_text += "\nExecution plan:\n"
+        for s in steps:
+            plan_text += f"  Step {s.get('step', '?')}: delegate to '{s.get('agent', '?')}' — {s.get('task', '')}\n"
+        plan_text += "\nUse the 'delegate' tool to execute each step in order. "
+        plan_text += "Pass the full step task description plus context from previous steps."
+
+        return plan_text
+
+
 class DelegateTool(RunnableTool):
     name = "delegate"
     description = "Delegate a task to a specialist agent. Input: agent_name (str), task (str)."
@@ -1649,76 +1839,46 @@ def _build_agent(args) -> tuple[AgentLoop, AgentConfig]:
     orchestrator._tools[run_skill.name] = run_skill
     orchestrator._tools[create_skill.name] = create_skill
 
-    # Sub-agents
+    # Shared agent registry (used by plan_agents, delegate, list_agents)
+    agent_registry = {}
+
+    tool_pool = {t.name: t for t in [
+        CalculatorTool(), WebSearchTool(), ShellTool(), ReadFileTool(),
+        WriteFileTool(), ListFilesTool(), PythonExecTool(), HttpFetchTool(),
+    ]}
+
+    provider_config = {
+        "base_url": args.base_url,
+        "api_key": args.api_key,
+        "model": model,
+        "vertex_project": project if args.provider == "vertex-claude" else os.environ.get("GOOGLE_CLOUD_PROJECT"),
+        "vertex_region": args.region if args.provider == "vertex-claude" else "global",
+    }
+
+    # Pre-defined agents from --agents
     if args.agents:
         try:
             with open(args.agents) as f:
                 agents_config = json.load(f)
-
-            all_tools_map = {t.name: t for t in [
-                CalculatorTool(), WebSearchTool(), ShellTool(), ReadFileTool(),
-                WriteFileTool(), ListFilesTool(), PythonExecTool(), HttpFetchTool(),
-            ]}
-
-            agent_registry = {}
-            for agent_name, acfg in agents_config.get("agents", {}).items():
-                sub_history = HistoryBackend()
-                sub_tools = [all_tools_map[t] for t in acfg.get("tools", []) if t in all_tools_map]
-                sub_orch = AgentOrchestrator(tools=sub_tools, history=sub_history)
-
-                if acfg.get("provider") == "vertex-claude":
-                    sub_proj = acfg.get("project") or os.environ.get("GOOGLE_CLOUD_PROJECT")
-                    sub_config = AgentConfig(
-                        model=acfg.get("model", "claude-sonnet-4-6"),
-                        max_retries=3, timeout_seconds=300.0,
-                        max_tokens=acfg.get("max_tokens", 4096), temperature=0.7,
-                    )
-                    sub_llm = VertexClaudeClient(project=sub_proj, region=acfg.get("region", "global"), config=sub_config)
-                else:
-                    sub_config = AgentConfig(
-                        model=acfg.get("model", "qwen3:8b"),
-                        max_retries=3, timeout_seconds=300.0,
-                        max_tokens=acfg.get("max_tokens", 4096), temperature=0.7,
-                    )
-                    sub_llm = LLMClient(
-                        base_url=acfg.get("base_url", args.base_url),
-                        api_key=acfg.get("api_key", args.api_key),
-                        config=sub_config,
-                    )
-
-                sub_loop = AgentLoop(
-                    llm_client=sub_llm, orchestrator=sub_orch,
-                    history=sub_history, config=sub_config,
-                    agent_name=agent_name,
-                )
-
-                def make_handler(loop, hist):
-                    def handler(task):
-                        hist.clear()
-                        hist.append({
-                            "role": "system",
-                            "content": (
-                                "You are a specialist agent. Complete the task using your tools. "
-                                "When done, respond with a TEXT SUMMARY of what you did. "
-                                "Do NOT keep calling tools indefinitely — finish and report back."
-                            ),
-                        })
-                        return loop.run(task)
-                    return handler
-
-                agent_registry[agent_name] = {
-                    "description": acfg.get("description", ""),
-                    "model": acfg.get("model", ""),
-                    "handler": make_handler(sub_loop, sub_history),
+            for aname, acfg in agents_config.get("agents", {}).items():
+                spec = {
+                    "name": aname,
+                    "role": acfg.get("description", ""),
+                    "tools": acfg.get("tools", []),
+                    "model": acfg.get("model", "qwen3:8b"),
                 }
-
-            delegate_tool = DelegateTool(agent_registry)
-            list_agents_tool = ListAgentsTool(agent_registry)
-            orchestrator._tools[delegate_tool.name] = delegate_tool
-            orchestrator._tools[list_agents_tool.name] = list_agents_tool
+                agent_registry[aname] = _create_agent_from_spec(spec, provider_config, tool_pool)
             print(f"{DIM}Agents: {', '.join(agent_registry.keys())}{RESET}")
         except Exception as exc:
             print(f"{DIM}Agents: failed to load — {exc}{RESET}")
+
+    # Always register planning + delegation tools
+    plan_tool = PlanAgentsTool(provider_config, tool_pool, agent_registry)
+    delegate_tool = DelegateTool(agent_registry)
+    list_agents_tool = ListAgentsTool(agent_registry)
+    orchestrator._tools[plan_tool.name] = plan_tool
+    orchestrator._tools[delegate_tool.name] = delegate_tool
+    orchestrator._tools[list_agents_tool.name] = list_agents_tool
 
     vertex_proj = project if args.provider == "vertex-claude" else None
     session = LivingSession(
