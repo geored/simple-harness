@@ -1374,6 +1374,12 @@ class AgentLoop:
         """
         logger.info("Agent loop starting — prompt: %r", user_prompt[:120])
 
+        from datetime import date
+        self._history.append({
+            "role": "system",
+            "content": f"Today's date is {date.today().isoformat()}.",
+        })
+
         if self._memory is not None:
             sys_msg = self._memory.system_message()
             if sys_msg:
