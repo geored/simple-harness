@@ -704,6 +704,7 @@ def _create_agent_from_spec(spec, provider_config, tool_pool):
         llm_client=sub_llm, orchestrator=sub_orch,
         history=sub_history, config=sub_config,
         agent_name=agent_name,
+        observer_mode="off",
     )
 
     def handler(task, _loop=sub_loop, _hist=sub_history):
@@ -1337,7 +1338,147 @@ class VertexClaudeClient:
 
 
 # ---------------------------------------------------------------------------
-# Subsystem 7: Agent Loop
+# Output Observer
+# ---------------------------------------------------------------------------
+
+class OutputClass:
+    FACTUAL_ANSWER = "factual_answer"
+    OPINION_ANALYSIS = "opinion_analysis"
+    CREATIVE_CONTENT = "creative_content"
+    ACKNOWLEDGMENT = "acknowledgment"
+    CLARIFICATION_REQ = "clarification_req"
+    RESEARCH_RESULT = "research_result"
+    CODE_GENERATED = "code_generated"
+    UNCERTAIN_ANSWER = "uncertain_answer"
+    MULTI_PART_TASK = "multi_part_task"
+
+
+@dataclass
+class ObservationResult:
+    output_class: str
+    confidence: float
+    is_terminal: bool
+    follow_up_action: Optional[str] = None
+    follow_up_parallel: bool = False
+    reasoning: str = ""
+
+
+class OutputObserver:
+    MAX_REFINEMENTS = 2
+    MIN_CONFIDENCE = 0.6
+
+    _UNCERTAINTY = ["i'm not sure", "i think", "possibly", "might be",
+                    "couldn't find", "no results found", "i don't know"]
+    _PARTIAL = ["step 1", "first,", "part 1", "phase 1"]
+    _COMPLETE = ["finally", "conclusion", "complete", "all done",
+                 "in summary", "here's how", "here are the steps",
+                 "that covers", "to summarize"]
+
+    def __init__(self, mode="hybrid", llm_client=None):
+        self.mode = mode
+        self._llm = llm_client
+        self._refinement_count = 0
+        self._previous_class = None
+
+    def reset(self):
+        self._refinement_count = 0
+        self._previous_class = None
+
+    def observe(self, output: str, context: dict) -> ObservationResult:
+        if self.mode == "off":
+            return ObservationResult(OutputClass.FACTUAL_ANSWER, 1.0, True)
+
+        if self._refinement_count >= self.MAX_REFINEMENTS:
+            return ObservationResult(OutputClass.FACTUAL_ANSWER, 1.0, True,
+                                    reasoning="Max refinements reached")
+
+        result = self._classify(output, context)
+
+        if result.confidence < self.MIN_CONFIDENCE:
+            result.is_terminal = True
+            result.reasoning += " (low confidence — defaulting to terminal)"
+            return result
+
+        if result.output_class == self._previous_class:
+            result.is_terminal = True
+            result.reasoning += " (repeated classification — breaking loop)"
+            return result
+
+        self._previous_class = result.output_class
+        if not result.is_terminal:
+            self._refinement_count += 1
+
+        return result
+
+    def _classify(self, output: str, context: dict) -> ObservationResult:
+        result = self._classify_heuristic(output, context)
+        if result.confidence > 0.7:
+            return result
+        if self._llm and self.mode == "hybrid":
+            try:
+                return self._classify_llm(output, context)
+            except Exception:
+                result.is_terminal = True
+                return result
+        return result
+
+    def _classify_heuristic(self, output: str, context: dict) -> ObservationResult:
+        words = output.split()
+        lower = output.lower()
+
+        if len(words) < 5:
+            return ObservationResult(OutputClass.ACKNOWLEDGMENT, 0.9, True,
+                                    reasoning="Minimal response")
+
+        if len(words) < 50 and self._refinement_count == 0:
+            return ObservationResult(OutputClass.FACTUAL_ANSWER, 0.85, True,
+                                    reasoning="Short direct answer")
+
+        matches = sum(1 for m in self._UNCERTAINTY if m in lower)
+        if matches >= 2:
+            return ObservationResult(OutputClass.UNCERTAIN_ANSWER, 0.65, False,
+                                    "Verify claims with additional search",
+                                    False, "Multiple uncertainty markers detected")
+
+        if "```" in output and ("def " in output or "class " in output):
+            return ObservationResult(OutputClass.CODE_GENERATED, 0.75, True,
+                                    "Consider running tests on generated code",
+                                    True, "Code generated")
+
+        has_partial = any(w in lower for w in self._PARTIAL)
+        has_complete = any(w in lower for w in self._COMPLETE)
+        if has_partial and not has_complete:
+            return ObservationResult(OutputClass.MULTI_PART_TASK, 0.65, False,
+                                    "Continue with remaining steps",
+                                    False, "Partial completion detected")
+
+        return ObservationResult(OutputClass.FACTUAL_ANSWER, 0.9, True,
+                                reasoning="Output appears complete")
+
+    def _classify_llm(self, output: str, context: dict) -> ObservationResult:
+        prompt = (
+            f"Classify this agent output. Is it complete and sufficient?\n"
+            f"Original request: {context.get('original_prompt', '')[:200]}\n"
+            f"Output (first 500 chars): {output[:500]}\n"
+            f"Respond with ONLY JSON: "
+            f'{{ "class": "factual_answer|uncertain_answer|multi_part_task", '
+            f'"is_complete": true, "confidence": 0.9, "reasoning": "why" }}'
+        )
+        response = self._llm.chat(messages=[{"role": "user", "content": prompt}])
+        text = (response.text or "").strip()
+        if text.startswith("```"):
+            text = text.split("\n", 1)[1].rsplit("```", 1)[0]
+        data = json.loads(text)
+        return ObservationResult(
+            output_class=data.get("class", OutputClass.FACTUAL_ANSWER),
+            confidence=data.get("confidence", 0.8),
+            is_terminal=data.get("is_complete", True),
+            reasoning=data.get("reasoning", "LLM classification"),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Agent Loop
 # ---------------------------------------------------------------------------
 
 class AgentLoop:
@@ -1367,10 +1508,15 @@ class AgentLoop:
         session: Optional[LivingSession] = None,
         mcp_manager=None,
         agent_name: Optional[str] = None,
+        observer_mode: str = "hybrid",
     ):
         self._llm = llm_client
         self._orch = orchestrator
         self._history = history
+        self._observer = OutputObserver(
+            mode=observer_mode,
+            llm_client=llm_client if observer_mode == "hybrid" else None,
+        )
         self._agent_name = agent_name
         self._config = config
         self._memory = memory
@@ -1385,6 +1531,7 @@ class AgentLoop:
         Returns the final answer string.
         """
         logger.info("Agent loop starting — prompt: %r", user_prompt[:120])
+        self._observer.reset()
 
         from datetime import date
         self._history.append({
@@ -1454,27 +1601,68 @@ class AgentLoop:
                 continue
 
             # ----------------------------------------------------------------
-            # Branch B: final text answer
+            # Branch B: text answer — observe before returning
             # ----------------------------------------------------------------
             if response.has_text:
                 self._history.append({
                     "role": "assistant",
                     "content": response.text,
                 })
-                snapshot = self._history.snapshot()
 
+                observation = self._observer.observe(response.text, {
+                    "original_prompt": user_prompt,
+                })
+
+                if not observation.is_terminal:
+                    cols = shutil.get_terminal_size().columns
+                    sys.stdout.write(f"\r{' ' * cols}\r")
+                    sys.stdout.write(f"  {GREEN_FG}●{RESET} {DIM}[observer] {observation.output_class} → refining{RESET}\n")
+                    sys.stdout.flush()
+
+                    # Remove rejected output, inject refinement prompt
+                    with self._history._lock:
+                        if self._history._history and self._history._history[-1].get("role") == "assistant":
+                            self._history._history.pop()
+                    self._history.append({
+                        "role": "system",
+                        "content": (
+                            f"[Observer] Your previous response was insufficient. "
+                            f"Issue: {observation.reasoning}. "
+                            f"Action: {observation.follow_up_action}. "
+                            f"Provide a more complete response."
+                        ),
+                    })
+                    _spinner_detail[0] = ""
+                    continue
+
+                # Terminal — log observation
+                if observation.output_class != OutputClass.FACTUAL_ANSWER:
+                    cols = shutil.get_terminal_size().columns
+                    sys.stdout.write(f"\r{' ' * cols}\r")
+                    sys.stdout.write(f"  {GREEN_FG}●{RESET} {DIM}[observer] {observation.output_class} → terminal{RESET}\n")
+                    sys.stdout.flush()
+
+                # Parallel follow-up
+                if observation.follow_up_action and observation.follow_up_parallel:
+                    def _follow_up(action, text):
+                        logger.info("[follow-up] %s", action)
+                    threading.Thread(target=_follow_up,
+                                   args=(observation.follow_up_action, response.text),
+                                   daemon=True).start()
+
+                # Consolidate memory in background
+                snapshot = self._history.snapshot()
                 def _consolidate_bg(snap, session, memory):
                     if session is not None:
                         session.consolidate(snap)
                     if memory is not None:
                         memory.consolidate(snap)
 
-                t = threading.Thread(
+                threading.Thread(
                     target=_consolidate_bg,
                     args=(snapshot, self._session, self._memory),
                     daemon=True,
-                )
-                t.start()
+                ).start()
 
                 logger.info("Agent loop complete after %d iteration(s).", iteration)
                 return response.text
@@ -2059,6 +2247,7 @@ def main():
                         history=sub_history,
                         config=agent._config,
                         memory=agent._memory,
+                        observer_mode="heuristic",
                     )
                     return sub_loop, sub_history
 
