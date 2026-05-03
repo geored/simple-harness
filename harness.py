@@ -1526,6 +1526,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Path to agents config JSON defining specialist sub-agents.",
     )
     parser.add_argument(
+        "--channels",
+        default=None,
+        help="Path to channels config JSON (telegram, slack, etc.).",
+    )
+    parser.add_argument(
         "--demo",
         action="store_true",
         help="Run a built-in demo without calling a real LLM endpoint.",
@@ -1679,20 +1684,26 @@ def _run_with_spinner(fn, label="Thinking"):
     return result_box[0]
 
 
-def repl(agent: AgentLoop, config: AgentConfig, registry=None) -> None:
-    print(_separator())
-    print(f"{BOLD}AI Harness{RESET} · {config.model}")
-    print(f"{DIM}Tools: {', '.join(agent._orch._tools.keys())}{RESET}")
+def repl(agent: AgentLoop, config: AgentConfig, registry=None, channel_names=None) -> None:
+    tool_count = len(agent._orch._tools)
+    mem_words = len(agent._memory.content.split()) if agent._memory and agent._memory.content else 0
+    mem_str = f"{mem_words} words" if mem_words else "empty"
+
+    info_parts = [f"Tools: {tool_count}", f"Memory: {mem_str}"]
+
     if agent._mcp is not None:
         mcp_status = agent._mcp.status()
         servers = mcp_status.get("servers", {})
-        parts = [f"{name} ({s.get('tools', 0)} tools)" for name, s in servers.items() if s.get("alive")]
-        if parts:
-            print(f"{DIM}MCP: {' · '.join(parts)}{RESET}")
-    if agent._memory is not None:
-        words = len(agent._memory.content.split()) if agent._memory.content else 0
-        status = f"{words} words" if words else "empty"
-        print(f"{DIM}Memory: {status}{RESET}")
+        alive = [name for name, s in servers.items() if s.get("alive")]
+        if alive:
+            info_parts.append(f"MCP: {', '.join(alive)}")
+
+    if channel_names:
+        info_parts.append(f"Channels: {', '.join(channel_names)}")
+
+    print(_separator())
+    print(f"{BOLD}AI Harness{RESET} · {config.model}")
+    print(f"{DIM}{' · '.join(info_parts)}{RESET}")
     print(_separator())
     print()
 
@@ -1938,6 +1949,34 @@ def main():
 
     agent, config, registry = _build_agent(args)
 
+    # Start messaging channels (telegram, etc.)
+    channel_router = None
+    if args.channels:
+        try:
+            from channels import load_channels, ChannelRouter
+
+            channels = load_channels(args.channels)
+            if channels:
+                def agent_factory():
+                    sub_history = HistoryBackend()
+                    sub_orch = AgentOrchestrator(
+                        tools=[t for t in agent._orch._tools.values()],
+                        history=sub_history,
+                    )
+                    sub_loop = AgentLoop(
+                        llm_client=agent._llm,
+                        orchestrator=sub_orch,
+                        history=sub_history,
+                        config=agent._config,
+                        memory=agent._memory,
+                    )
+                    return sub_loop, sub_history
+
+                channel_router = ChannelRouter(channels, agent_factory)
+                channel_router.start()
+        except Exception as exc:
+            print(f"{DIM}Channels: failed — {exc}{RESET}")
+
     if args.prompt:
         print(f"\n{BOLD}User:{RESET} {args.prompt}\n")
         try:
@@ -1952,7 +1991,11 @@ def main():
             agent._orch.shutdown()
         _console.print(Markdown(answer))
     else:
-        repl(agent, config, registry)
+        ch_names = [c.name for c in channel_router._channels.values()] if channel_router else None
+        repl(agent, config, registry, channel_names=ch_names)
+
+    if channel_router:
+        channel_router.stop()
 
 
 if __name__ == "__main__":
