@@ -1421,20 +1421,13 @@ class AgentLoop:
                 if self._agent_name:
                     _set_agent_status(self._agent_name, f"{tool_name}")
                 else:
-                    _spinner_detail[0] = f"Running {tool_name}"
-                logger.info(
-                    "Executing tool '%s' with args: %s", tool_name, arguments
-                )
-                result = self._orch.run_tool(tool_name, tool_call_id=tool_call_id, **arguments)
+                    cols = shutil.get_terminal_size().columns
+                    sys.stdout.write(f"\r{' ' * cols}\r")
+                    sys.stdout.write(f"  {GREEN_FG}●{RESET} {DIM}{tool_name}{RESET}\n")
+                    sys.stdout.flush()
+                    _spinner_detail[0] = f"{tool_name}"
 
-                if result.success:
-                    logger.info(
-                        "Tool '%s' succeeded: %s", tool_name, str(result.output)[:200]
-                    )
-                else:
-                    logger.warning(
-                        "Tool '%s' failed: %s", tool_name, result.error
-                    )
+                result = self._orch.run_tool(tool_name, tool_call_id=tool_call_id, **arguments)
 
                 if self._agent_name:
                     _set_agent_status(self._agent_name, "thinking...")
@@ -1668,6 +1661,10 @@ UP_LINE = "\033[A"
 def _set_agent_status(name: str, status: str):
     with _agent_status_lock:
         _agent_status[name] = status
+    cols = shutil.get_terminal_size().columns
+    sys.stdout.write(f"\r{' ' * cols}\r")
+    sys.stdout.write(f"  {GREEN_FG}●{RESET} {DIM}{name} · {status}{RESET}\n")
+    sys.stdout.flush()
 
 
 def _clear_agent_status(name: str):
