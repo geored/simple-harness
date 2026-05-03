@@ -7,6 +7,7 @@ session.md
 cortex_memory.json
 *.pt
 *.db
+.checkpoints/
 price_monitor/
 url_shortener/
 telegram_bot/

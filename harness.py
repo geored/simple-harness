@@ -11,6 +11,7 @@ import time
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Optional, get_type_hints
 
 import requests
@@ -63,13 +64,39 @@ def apply_and_revalidate_overrides(base_config, overrides):
 # ---------------------------------------------------------------------------
 
 class HistoryBackend:
-    def __init__(self):
+    """Thread-safe conversation history with optional JSONL checkpointing.
+
+    When checkpoint_id is provided, every append is flushed to disk.
+    On startup with resume=True, replays the checkpoint file into memory.
+    clear() resets in-memory history but keeps the checkpoint file intact.
+    """
+
+    CHECKPOINT_DIR = Path(".checkpoints")
+
+    def __init__(self, checkpoint_id: Optional[str] = None, resume: bool = True):
         self._lock = threading.Lock()
-        self._history = []
+        self._history: list[dict] = []
+        self._seq = 0
+        self._file = None
+        self.checkpoint_id = checkpoint_id
+
+        if checkpoint_id:
+            self.CHECKPOINT_DIR.mkdir(exist_ok=True)
+            self._path = self.CHECKPOINT_DIR / f"{checkpoint_id}.jsonl"
+            if resume and self._path.exists():
+                self._load()
+            self._file = self._path.open("a", encoding="utf-8")
 
     def append(self, entry):
         with self._lock:
             self._history.append(entry)
+            if self._file:
+                import json as _json
+                from datetime import datetime as _dt, timezone as _tz
+                record = {"seq": self._seq, "ts": _dt.now(_tz.utc).isoformat(), "entry": entry}
+                self._file.write(_json.dumps(record, default=str) + "\n")
+                self._file.flush()
+                self._seq += 1
 
     def snapshot(self):
         with self._lock:
@@ -82,6 +109,49 @@ class HistoryBackend:
     def __len__(self):
         with self._lock:
             return len(self._history)
+
+    def close(self):
+        with self._lock:
+            if self._file:
+                self._file.flush()
+                self._file.close()
+                self._file = None
+
+    def _load(self):
+        loaded = 0
+        with self._path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                    self._history.append(record["entry"])
+                    self._seq = record["seq"] + 1
+                    loaded += 1
+                except (json.JSONDecodeError, KeyError):
+                    continue
+        if loaded:
+            logger.info("Resumed checkpoint '%s' — %d turns", self.checkpoint_id, loaded)
+
+    @classmethod
+    def list_checkpoints(cls) -> list[dict]:
+        if not cls.CHECKPOINT_DIR.exists():
+            return []
+        results = []
+        for p in sorted(cls.CHECKPOINT_DIR.glob("*.jsonl"), reverse=True):
+            try:
+                lines = p.read_text(encoding="utf-8").strip().splitlines()
+                count = len(lines)
+                last_ts = json.loads(lines[-1])["ts"] if lines else None
+                size_kb = p.stat().st_size / 1024
+                results.append({
+                    "id": p.stem, "turns": count,
+                    "last_ts": last_ts, "size_kb": round(size_kb, 1),
+                })
+            except Exception:
+                continue
+        return results
 
 
 # ---------------------------------------------------------------------------
@@ -1456,6 +1526,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Working directory for file operations. Creates it if needed. Default: current directory.",
     )
     parser.add_argument(
+        "--checkpoint-id",
+        default=None,
+        help="Resume a previous conversation by checkpoint ID.",
+    )
+    parser.add_argument(
+        "--list-checkpoints",
+        action="store_true",
+        help="Print saved checkpoints and exit.",
+    )
+    parser.add_argument(
         "--provider",
         default="openai",
         choices=["openai", "vertex-claude"],
@@ -1660,6 +1740,9 @@ def repl(agent: AgentLoop, config: AgentConfig, registry=None, channel_names=Non
     if channel_names:
         info_parts.append(f"Channels: {', '.join(channel_names)}")
 
+    if agent._history.checkpoint_id:
+        info_parts.append(f"Session: {agent._history.checkpoint_id}")
+
     print(_separator())
     print(f"{BOLD}AI Harness{RESET} · {config.model}")
     print(f"{DIM}{' · '.join(info_parts)}{RESET}")
@@ -1735,6 +1818,7 @@ def repl(agent: AgentLoop, config: AgentConfig, registry=None, channel_names=Non
         print()
 
     agent._orch.shutdown()
+    agent._history.close()
     if agent._session is not None:
         agent._session.clear()
     if agent._mcp is not None:
@@ -1758,7 +1842,12 @@ def _build_agent(args) -> tuple[AgentLoop, AgentConfig]:
         print(f"Configuration error: {exc}", file=sys.stderr)
         sys.exit(1)
 
-    history = HistoryBackend()
+    checkpoint_id = getattr(args, "checkpoint_id", None)
+    if not checkpoint_id:
+        from datetime import datetime as _dt, timezone as _tz
+        checkpoint_id = _dt.now(_tz.utc).strftime("%Y%m%dT%H%M%S")
+    history = HistoryBackend(checkpoint_id=checkpoint_id, resume=True)
+
     registry = SkillRegistry()
     project = None
 
@@ -1893,6 +1982,17 @@ def main():
         logging.getLogger("agent_harness").setLevel(logging.ERROR)
         logging.getLogger("httpx").setLevel(logging.WARNING)
         logging.getLogger("anthropic").setLevel(logging.WARNING)
+
+    if args.list_checkpoints:
+        rows = HistoryBackend.list_checkpoints()
+        if not rows:
+            print("No checkpoints found.")
+        else:
+            print(f"{'ID':30s}  {'Turns':6s}  {'Size':8s}  Last activity")
+            print("-" * 75)
+            for r in rows:
+                print(f"{r['id']:30s}  {r['turns']:>5d}   {r['size_kb']:>6.1f}KB  {r.get('last_ts', '?')}")
+        return
 
     if args.workspace:
         import pathlib
