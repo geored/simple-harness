@@ -1331,7 +1331,7 @@ class AgentLoop:
 
     # We use max_retries from AgentConfig as the maximum number of LLM turns
     # (not just HTTP retries).  A separate ceiling prevents infinite loops.
-    _HARD_ITERATION_CEILING = 30
+    _HARD_ITERATION_CEILING = 50
 
     def __init__(
         self,
