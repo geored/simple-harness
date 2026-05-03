@@ -1666,8 +1666,6 @@ def _clear_agent_status(name: str):
 
 def _run_with_spinner(fn, label="Thinking"):
     _spinner_detail[0] = ""
-    with _agent_status_lock:
-        _agent_status.clear()
     result_box = [None, None]
 
     def worker():
@@ -1679,55 +1677,27 @@ def _run_with_spinner(fn, label="Thinking"):
     t = threading.Thread(target=worker)
     t.start()
     start = time.time()
-    frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
-    idx = 0
-    prev_lines = 0
-
-    cols = shutil.get_terminal_size().columns
+    last_line = ""
 
     while t.is_alive():
         elapsed = int(time.time() - start)
-        frame = frames[idx % len(frames)]
         detail = _spinner_detail[0]
 
-        # Build main line
-        main = f"{frame} {label}"
+        line = f"● {label}"
         if detail:
-            main += f" · {detail}"
-        main += f" · {elapsed}s"
+            line += f" · {detail}"
+        line += f" · {elapsed}s"
 
-        # Agent status lines
-        with _agent_status_lock:
-            agents = dict(_agent_status)
+        if line != last_line:
+            cols = shutil.get_terminal_size().columns
+            padded = line.ljust(cols)[:cols]
+            sys.stdout.write(f"\r{MAGENTA}{padded}{RESET}")
+            sys.stdout.flush()
+            last_line = line
 
-        agent_lines = []
-        for name, status in agents.items():
-            agent_lines.append(f"  ● {name:12s} · {status}")
+        t.join(timeout=0.5)
 
-        # Clear previous output: move up and clear each line
-        if prev_lines > 0:
-            for _ in range(prev_lines):
-                sys.stdout.write(f"\033[A\033[2K")
-        sys.stdout.write(f"\r\033[2K")
-
-        # Write new output
-        padded = main.ljust(cols)[:cols]
-        sys.stdout.write(f"\r{MAGENTA}{padded}{RESET}")
-
-        for al in agent_lines:
-            padded_al = al.ljust(cols)[:cols]
-            sys.stdout.write(f"\n{GREEN_FG}{padded_al}{RESET}")
-
-        sys.stdout.flush()
-        prev_lines = len(agent_lines)
-        idx += 1
-        t.join(timeout=0.1)
-
-    # Final cleanup
-    if prev_lines > 0:
-        for _ in range(prev_lines):
-            sys.stdout.write(f"\033[A\033[2K")
-    sys.stdout.write(f"\r\033[2K")
+    sys.stdout.write(f"\r{' ' * shutil.get_terminal_size().columns}\r")
     sys.stdout.flush()
 
     if result_box[1]:
