@@ -1972,7 +1972,22 @@ def _build_agent(args) -> tuple[AgentLoop, AgentConfig]:
     return agent, config, registry
 
 
+def _load_dotenv():
+    env_path = Path(".env")
+    if not env_path.exists():
+        return
+    for line in env_path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key, value = key.strip(), value.strip()
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
 def main():
+    _load_dotenv()
     parser = build_arg_parser()
     args = parser.parse_args()
 
