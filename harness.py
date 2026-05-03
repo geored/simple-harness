@@ -1635,12 +1635,11 @@ class AgentLoop:
                     _spinner_detail[0] = ""
                     continue
 
-                # Terminal — log observation
-                if observation.output_class != OutputClass.FACTUAL_ANSWER:
-                    cols = shutil.get_terminal_size().columns
-                    sys.stdout.write(f"\r{' ' * cols}\r")
-                    sys.stdout.write(f"  {GREEN_FG}●{RESET} {DIM}[observer] {observation.output_class} → terminal{RESET}\n")
-                    sys.stdout.flush()
+                # Always show observation result
+                cols = shutil.get_terminal_size().columns
+                sys.stdout.write(f"\r{' ' * cols}\r")
+                sys.stdout.write(f"  {GREEN_FG}●{RESET} {DIM}[observer] {observation.output_class} → terminal ({observation.confidence:.0%}){RESET}\n")
+                sys.stdout.flush()
 
                 # Parallel follow-up
                 if observation.follow_up_action and observation.follow_up_parallel:
