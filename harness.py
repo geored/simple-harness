@@ -822,11 +822,15 @@ class DelegateTool(RunnableTool):
 
     def __init__(self, agent_registry):
         self._agents = agent_registry
-        agents_desc = ", ".join(f"{n} ({a['description']})" for n, a in self._agents.items())
-        self.description = (
+
+    def to_openai_schema(self) -> dict:
+        agents_desc = ", ".join(f"{n} ({a['description']})" for n, a in self._agents.items()) if self._agents else "none yet — use plan_agents first"
+        schema = super().to_openai_schema()
+        schema["function"]["description"] = (
             f"Delegate a task to a specialist agent. Available agents: {agents_desc}. "
             "Input: agent_name (str), task (str)."
         )
+        return schema
 
     def run(self, agent_name: str = "", task: str = "", **kwargs) -> str:
         agent_name = agent_name or kwargs.get("name", kwargs.get("agent", ""))
@@ -851,9 +855,15 @@ class DelegateTool(RunnableTool):
             _set_agent_status(agent_name, "done")
             time.sleep(0.2)
             _clear_agent_status(agent_name)
+            orch = agent.get("orchestrator")
+            if orch:
+                orch.shutdown()
             return result if isinstance(result, str) else json.dumps(result, default=str)
         except Exception as exc:
             _clear_agent_status(agent_name)
+            orch = agent.get("orchestrator")
+            if orch:
+                orch.shutdown()
             return f"Agent '{agent_name}' failed: {exc}"
 
 
@@ -901,8 +911,10 @@ class AgentOrchestrator:
     def context_snapshot(self):
         return self._history.snapshot()
 
+    def register_tool(self, tool) -> None:
+        self._tools[tool.name] = tool
+
     def tool_schemas(self) -> list[dict]:
-        """Return OpenAI-compatible tool schemas for all registered tools."""
         return [tool.to_openai_schema() for tool in self._tools.values()]
 
     def shutdown(self):
@@ -1368,7 +1380,7 @@ class AgentLoop:
             for r in results:
                 mcp_tool = self._mcp.get_tool(r.tool.qualified_name)
                 if mcp_tool and mcp_tool.name not in self._orch._tools:
-                    self._orch._tools[mcp_tool.name] = mcp_tool
+                    self._orch.register_tool(mcp_tool)
                     tool_schemas.append(mcp_tool.to_openai_schema())
                     _spinner_detail[0] = f"+ {r.tool.qualified_name}"
 
@@ -1907,8 +1919,8 @@ def _build_agent(args) -> tuple[AgentLoop, AgentConfig]:
 
     run_skill = RunSkillTool(registry, mcp_manager=mcp_manager)
     create_skill = CreateSkillTool(registry)
-    orchestrator._tools[run_skill.name] = run_skill
-    orchestrator._tools[create_skill.name] = create_skill
+    orchestrator.register_tool(run_skill)
+    orchestrator.register_tool(create_skill)
 
     # Shared agent registry (used by plan_agents, delegate, list_agents)
     agent_registry = {}
@@ -1947,9 +1959,9 @@ def _build_agent(args) -> tuple[AgentLoop, AgentConfig]:
     plan_tool = PlanAgentsTool(provider_config, tool_pool, agent_registry)
     delegate_tool = DelegateTool(agent_registry)
     list_agents_tool = ListAgentsTool(agent_registry)
-    orchestrator._tools[plan_tool.name] = plan_tool
-    orchestrator._tools[delegate_tool.name] = delegate_tool
-    orchestrator._tools[list_agents_tool.name] = list_agents_tool
+    orchestrator.register_tool(plan_tool)
+    orchestrator.register_tool(delegate_tool)
+    orchestrator.register_tool(list_agents_tool)
 
     vertex_proj = project if args.provider == "vertex-claude" else None
     session = LivingSession(

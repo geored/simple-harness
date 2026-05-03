@@ -33,38 +33,8 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 1. RunnableTool ABC (stub — replace with your harness import)
-# ─────────────────────────────────────────────────────────────────────────────
-
-class RunnableTool(abc.ABC):
-    """Abstract base class every tool in the harness must implement."""
-
-    @property
-    @abc.abstractmethod
-    def name(self) -> str: ...
-
-    @property
-    @abc.abstractmethod
-    def description(self) -> str: ...
-
-    @property
-    @abc.abstractmethod
-    def parameters_schema(self) -> Dict[str, Any]: ...
-
-    @abc.abstractmethod
-    def run(self, **kwargs) -> Any: ...
-
-    # Optional: called by orchestrator to get OpenAI-style function spec
-    def to_openai_function(self) -> Dict[str, Any]:
-        return {
-            "type": "function",
-            "function": {
-                "name": self.name,
-                "description": self.description,
-                "parameters": self.parameters_schema,
-            },
-        }
+# RunnableTool is imported from harness at runtime via MCPToolBridge.
+# No duplicate ABC needed here.
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1084,48 +1054,10 @@ def _validate_config(config: Dict) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 # 10. AgentOrchestrator integration helpers
 # ─────────────────────────────────────────────────────────────────────────────
+# End of MCP client library
+# ─────────────────────────────────────────────────────────────────────────────
 
-class MCPAwareOrchestrator:
-    """
-    Thin wrapper that enriches an existing AgentOrchestrator with MCP tools.
+# MCPAwareOrchestrator removed — harness integrates MCP tools directly
+# via AgentLoop MCP search injection.
 
-    Usage (pseudocode):
-        base_orchestrator = AgentOrchestrator(llm=..., tools=[calc, shell])
-        mcp_mgr = MCPClientManager.from_config(cfg)
-        orchestrator = MCPAwareOrchestrator(base_orchestrator, mcp_mgr)
-        orchestrator.run("create a github issue for the failing tests")
-    """
-
-    def __init__(self, base_orchestrator, mcp_manager: MCPClientManager):
-        self._base = base_orchestrator
-        self._mcp = mcp_manager
-
-    def _enrich_context(self, prompt: str) -> str:
-        snippet = self._mcp.build_tool_context_snippet(prompt)
-        if snippet:
-            return f"{snippet}\n\n---\n{prompt}"
-        return prompt
-
-    def _all_tools(self) -> List[RunnableTool]:
-        base_tools: List[RunnableTool] = getattr(self._base, "tools", [])
-        mcp_tools = self._mcp.get_all_runnable_tools()
-        return base_tools + mcp_tools
-
-    def run(self, prompt: str) -> str:
-        enriched = self._enrich_context(prompt)
-        all_tools = self._all_tools()
-        # Inject into base orchestrator — adapt to your actual API
-        return self._base.run(enriched, tools=all_tools)
-
-    def search_and_run(self, query: str, tool_query: str | None = None) -> str:
-        """
-        Search for the most relevant tool, then run the agent with it pre-selected.
-        """
-        results = self._mcp.search_tools(tool_query or query, top_k=3)
-        if results:
-            best = results[0]
-            logger.info(
-                "Pre-selected tool: %s (score=%.2f, reason=%s)",
-                best.tool.qualified_name, best.score, best.match_reason,
-            )
-        return self.run(query)
+# MCPAwareOrchestrator removed — harness integrates MCP tools directly.
