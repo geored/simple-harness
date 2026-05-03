@@ -106,6 +106,12 @@ class HistoryBackend:
         with self._lock:
             self._history.clear()
 
+    def trim(self, keep_last: int = 10):
+        """Keep only the last N entries. Preserves recent conversation context."""
+        with self._lock:
+            if len(self._history) > keep_last:
+                self._history = self._history[-keep_last:]
+
     def __len__(self):
         with self._lock:
             return len(self._history)
@@ -914,6 +920,12 @@ class AgentOrchestrator:
     def register_tool(self, tool) -> None:
         self._tools[tool.name] = tool
 
+    def tool_names(self) -> list[str]:
+        return list(self._tools.keys())
+
+    def tool_count(self) -> int:
+        return len(self._tools)
+
     def tool_schemas(self) -> list[dict]:
         return [tool.to_openai_schema() for tool in self._tools.values()]
 
@@ -1373,20 +1385,19 @@ class AgentLoop:
                 self._history.append(ses_msg)
 
         self._orch.submit_user_message(user_prompt)
-        tool_schemas = self._orch.tool_schemas()
 
         if self._mcp is not None:
             results = self._mcp.search_tools(user_prompt, top_k=5)
             for r in results:
                 mcp_tool = self._mcp.get_tool(r.tool.qualified_name)
-                if mcp_tool and mcp_tool.name not in self._orch._tools:
+                if mcp_tool:
                     self._orch.register_tool(mcp_tool)
-                    tool_schemas.append(mcp_tool.to_openai_schema())
                     _spinner_detail[0] = f"+ {r.tool.qualified_name}"
 
         for iteration in range(1, self._max_iterations + 1):
             logger.info("--- Agent iteration %d/%d ---", iteration, self._max_iterations)
 
+            tool_schemas = self._orch.tool_schemas()
             messages = self._history.snapshot()
             response = self._llm.chat(messages=messages, tools=tool_schemas)
 
@@ -1706,7 +1717,7 @@ def _run_with_spinner(fn, label="Thinking"):
 
 
 def repl(agent: AgentLoop, config: AgentConfig, registry=None, channel_names=None) -> None:
-    tool_count = len(agent._orch._tools)
+    tool_count = agent._orch.tool_count()
     mem_words = len(agent._memory.content.split()) if agent._memory and agent._memory.content else 0
     mem_str = f"{mem_words} words" if mem_words else "empty"
 
@@ -1772,7 +1783,7 @@ def repl(agent: AgentLoop, config: AgentConfig, registry=None, channel_names=Non
             if skill_name in registry:
                 content = registry.load_skill(skill_name)
                 if content:
-                    agent._history.clear()
+                    agent._history.trim(keep_last=10)
                     agent._history.append({"role": "user", "content": f"Activate and follow this skill:\n\n{content}"})
                     print()
                     try:
@@ -1788,7 +1799,7 @@ def repl(agent: AgentLoop, config: AgentConfig, registry=None, channel_names=Non
                     print(f"{DIM}Skill '{skill_name}' could not be loaded.{RESET}")
                     continue
 
-        agent._history.clear()
+        agent._history.trim(keep_last=10)
         print()
         try:
             answer = _run_with_spinner(lambda: agent.run(prompt))
@@ -2016,8 +2027,15 @@ def main():
             if channels:
                 def agent_factory():
                     sub_history = HistoryBackend()
+                    fresh_tools = [
+                        CalculatorTool(), WebSearchTool(), ShellTool(),
+                        ReadFileTool(), WriteFileTool(), ListFilesTool(),
+                        PythonExecTool(), HttpFetchTool(),
+                        ListSkillsTool(registry),
+                        RunSkillTool(registry),
+                    ]
                     sub_orch = AgentOrchestrator(
-                        tools=[t for t in agent._orch._tools.values()],
+                        tools=fresh_tools,
                         history=sub_history,
                     )
                     sub_loop = AgentLoop(
