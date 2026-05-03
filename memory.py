@@ -79,9 +79,20 @@ class _LivingDocument:
             conversation=conv_text,
         )
         try:
-            self._content = self._call_llm(prompt).strip()
+            new_content = self._call_llm(prompt).strip()
+            old_words = len(self._content.split()) if self._content else 0
+            new_words = len(new_content.split()) if new_content else 0
+
+            if old_words > 20 and new_words < old_words * 0.3:
+                logger.warning(
+                    "%s consolidation rejected: would shrink from %d to %d words (>70%% loss)",
+                    self.__class__.__name__, old_words, new_words,
+                )
+                return
+
+            self._content = new_content
             self._save()
-            logger.info("%s consolidated (%d words)", self.__class__.__name__, len(self._content.split()))
+            logger.info("%s consolidated (%d words)", self.__class__.__name__, new_words)
         except Exception as exc:
             logger.warning("%s consolidation failed: %s", self.__class__.__name__, exc)
 
