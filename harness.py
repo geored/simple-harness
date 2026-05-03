@@ -1,5 +1,4 @@
 import argparse
-import hashlib
 import inspect
 import json
 import logging
@@ -12,8 +11,6 @@ import time
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from enum import Enum
 from typing import Any, Callable, Optional, get_type_hints
 
 import requests
@@ -62,55 +59,7 @@ def apply_and_revalidate_overrides(base_config, overrides):
 
 
 # ---------------------------------------------------------------------------
-# Subsystem 2: Checkpointing
-# ---------------------------------------------------------------------------
-
-class BackendType(str, Enum):
-    REDIS = "redis"
-    POSTGRES = "postgres"
-    MEMORY = "memory"
-
-
-class CheckpointV1(BaseModel):
-    schema_version: int = 1
-    step: int
-    messages: list[dict]
-    tool_results: dict[str, Any]
-
-
-class CheckpointV2(BaseModel):
-    schema_version: int = 2
-    phase: int
-    messages: list[dict]
-    tool_results: dict[str, Any]
-    backend_type: str
-    written_at: str
-    field_fingerprint: str
-
-    @classmethod
-    def field_names(cls):
-        return frozenset(cls.model_fields.keys())
-
-    @classmethod
-    def compute_fingerprint(cls):
-        canonical = json.dumps(sorted(cls.field_names()), separators=(",", ":"))
-        return hashlib.sha256(canonical.encode()).hexdigest()[:16]
-
-
-MIGRATIONS = {
-    (1, 2): lambda old: {
-        **{k: v for k, v in old.items() if k != "step"},
-        "phase": old["step"],
-        "schema_version": 2,
-        "backend_type": old.get("backend_type", BackendType.MEMORY.value),
-        "written_at": datetime.now(timezone.utc).isoformat(),
-        "field_fingerprint": CheckpointV2.compute_fingerprint(),
-    },
-}
-
-
-# ---------------------------------------------------------------------------
-# Subsystem 3: History Backend
+# History Backend
 # ---------------------------------------------------------------------------
 
 class HistoryBackend:
@@ -1409,10 +1358,20 @@ class AgentLoop:
                     "content": response.text,
                 })
                 snapshot = self._history.snapshot()
-                if self._session is not None:
-                    self._session.consolidate(snapshot)
-                if self._memory is not None:
-                    self._memory.consolidate(snapshot)
+
+                def _consolidate_bg(snap, session, memory):
+                    if session is not None:
+                        session.consolidate(snap)
+                    if memory is not None:
+                        memory.consolidate(snap)
+
+                t = threading.Thread(
+                    target=_consolidate_bg,
+                    args=(snapshot, self._session, self._memory),
+                    daemon=True,
+                )
+                t.start()
+
                 logger.info("Agent loop complete after %d iteration(s).", iteration)
                 return response.text
 
@@ -1801,6 +1760,7 @@ def _build_agent(args) -> tuple[AgentLoop, AgentConfig]:
 
     history = HistoryBackend()
     registry = SkillRegistry()
+    project = None
 
     if args.provider == "vertex-claude":
         project = args.project or os.environ.get("GOOGLE_CLOUD_PROJECT")
