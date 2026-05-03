@@ -107,10 +107,22 @@ class HistoryBackend:
             self._history.clear()
 
     def trim(self, keep_last: int = 10):
-        """Keep only the last N entries. Preserves recent conversation context."""
+        """Keep only the last N entries, ensuring no orphaned tool results.
+
+        Trims from the front, but if the new start is a tool result
+        (which needs a preceding tool_use), keeps moving forward until
+        we find a clean boundary (user or system message).
+        """
         with self._lock:
-            if len(self._history) > keep_last:
-                self._history = self._history[-keep_last:]
+            if len(self._history) <= keep_last:
+                return
+            start = len(self._history) - keep_last
+            while start < len(self._history):
+                role = self._history[start].get("role", "")
+                if role in ("user", "system"):
+                    break
+                start += 1
+            self._history = self._history[start:]
 
     def __len__(self):
         with self._lock:
