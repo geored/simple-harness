@@ -1583,14 +1583,46 @@ class AgentLoop:
                     "tool_calls": tc["_raw_tool_calls"],
                 })
 
+                # Build tool summary for display
+                _tool_hint = ""
+                if tool_name == "write_file":
+                    _tool_hint = arguments.get("path", arguments.get("filename", ""))
+                elif tool_name == "read_file":
+                    _tool_hint = arguments.get("path", "")
+                elif tool_name == "shell":
+                    cmd = arguments.get("command", "")
+                    _tool_hint = cmd[:60] + ("..." if len(cmd) > 60 else "")
+                elif tool_name == "list_files":
+                    _tool_hint = arguments.get("path", ".")
+                elif tool_name == "web_search":
+                    _tool_hint = arguments.get("query", "")[:50]
+                elif tool_name == "http_fetch":
+                    _tool_hint = arguments.get("url", "")[:50]
+                elif tool_name == "python_exec":
+                    code = arguments.get("code", "")
+                    first_line = code.split("\n")[0][:50] if code else ""
+                    _tool_hint = first_line
+                elif tool_name == "calculator":
+                    _tool_hint = arguments.get("expr", "")
+                elif tool_name == "run_skill":
+                    _tool_hint = arguments.get("skill_name", arguments.get("name", ""))
+                elif tool_name == "delegate":
+                    _tool_hint = arguments.get("agent_name", arguments.get("name", ""))
+                elif tool_name == "plan_agents":
+                    _tool_hint = arguments.get("task_description", "")[:40]
+                elif tool_name == "create_skill":
+                    _tool_hint = arguments.get("skill_name", arguments.get("name", ""))
+
+                display = f"{tool_name}({_tool_hint})" if _tool_hint else tool_name
+
                 if self._agent_name:
-                    _set_agent_status(self._agent_name, f"{tool_name}")
+                    _set_agent_status(self._agent_name, display)
                 else:
                     cols = shutil.get_terminal_size().columns
                     sys.stdout.write(f"\r{' ' * cols}\r")
-                    sys.stdout.write(f"  {GREEN_FG}●{RESET} {DIM}{tool_name}{RESET}\n")
+                    sys.stdout.write(f"  {GREEN_FG}●{RESET} {DIM}{display}{RESET}\n")
                     sys.stdout.flush()
-                    _spinner_detail[0] = f"{tool_name}"
+                    _spinner_detail[0] = display
 
                 result = self._orch.run_tool(tool_name, tool_call_id=tool_call_id, **arguments)
 
