@@ -32,7 +32,7 @@ class AgentConfig(BaseModel):
     model: str = "qwen3:8b"
     max_retries: int = 3
     timeout_seconds: float = 30.0
-    max_tokens: int = 4096
+    max_tokens: int = 16384
     temperature: float = 0.7
     tool_call_timeout: float = 10.0
 
@@ -1532,11 +1532,17 @@ class AgentLoop:
         """
         logger.info("Agent loop starting — prompt: %r", user_prompt[:120])
         self._observer.reset()
+        _tool_call_counts: dict[str, int] = {}
 
         from datetime import date
         self._history.append({
             "role": "system",
-            "content": f"Today's date is {date.today().isoformat()}.",
+            "content": (
+                f"Today's date is {date.today().isoformat()}. "
+                "When creating files: split large content into separate files (HTML, CSS, JS). "
+                "Never call write_file on the same path twice — one call per file. "
+                "If a file is too large, break it into modules."
+            ),
         })
 
         if self._memory is not None:
@@ -1574,6 +1580,25 @@ class AgentLoop:
                 tool_name = tc["name"]
                 arguments = tc["arguments"]
                 tool_call_id = tc["id"]
+
+                # Detect repeated identical tool calls
+                call_key = f"{tool_name}:{json.dumps(sorted(arguments.items()) if isinstance(arguments, dict) else arguments, default=str)[:200]}"
+                _tool_call_counts[call_key] = _tool_call_counts.get(call_key, 0) + 1
+                if _tool_call_counts[call_key] >= 3:
+                    self._history.append({
+                        "role": "assistant", "content": None,
+                        "tool_calls": tc["_raw_tool_calls"],
+                    })
+                    self._history.append({
+                        "role": "tool", "tool_call_id": tool_call_id, "tool_name": tool_name,
+                        "status": "failure", "output": None,
+                        "error": f"Tool '{tool_name}' called {_tool_call_counts[call_key]} times with same arguments. Stop repeating and move on to the next step or provide your final answer.",
+                    })
+                    cols = shutil.get_terminal_size().columns
+                    sys.stdout.write(f"\r{' ' * cols}\r")
+                    sys.stdout.write(f"  {MAGENTA}●{RESET} {DIM}[loop-break] {tool_name} called {_tool_call_counts[call_key]}x — forcing next step{RESET}\n")
+                    sys.stdout.flush()
+                    continue
 
                 # Append the assistant's tool-call turn to history so the LLM
                 # sees its own decision on the next turn.
@@ -1758,8 +1783,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-tokens",
         type=int,
-        default=4096,
-        help="Maximum tokens in the LLM response. Default: 4096",
+        default=16384,
+        help="Maximum tokens in the LLM response. Default: 16384",
     )
     parser.add_argument(
         "--max-retries",
