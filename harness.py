@@ -1584,6 +1584,19 @@ class AgentLoop:
                 # Detect repeated identical tool calls
                 call_key = f"{tool_name}:{json.dumps(sorted(arguments.items()) if isinstance(arguments, dict) else arguments, default=str)[:200]}"
                 _tool_call_counts[call_key] = _tool_call_counts.get(call_key, 0) + 1
+
+                # Also track total calls to same tool regardless of args
+                _tool_name_key = f"__total__{tool_name}"
+                _tool_call_counts[_tool_name_key] = _tool_call_counts.get(_tool_name_key, 0) + 1
+
+                # Hard exit after 5 repeated same-arg calls OR 15 total calls to any single tool
+                if _tool_call_counts[call_key] >= 5 or _tool_call_counts[_tool_name_key] >= 15:
+                    cols = shutil.get_terminal_size().columns
+                    sys.stdout.write(f"\r{' ' * cols}\r")
+                    sys.stdout.write(f"  {MAGENTA}●{RESET} {DIM}[loop-exit] {tool_name} stuck — returning partial result{RESET}\n")
+                    sys.stdout.flush()
+                    return f"(Agent stopped: {tool_name} was called repeatedly without progress. Partial work may have been saved to disk.)"
+
                 if _tool_call_counts[call_key] >= 3:
                     self._history.append({
                         "role": "assistant", "content": None,
@@ -1592,7 +1605,7 @@ class AgentLoop:
                     self._history.append({
                         "role": "tool", "tool_call_id": tool_call_id, "tool_name": tool_name,
                         "status": "failure", "output": None,
-                        "error": f"Tool '{tool_name}' called {_tool_call_counts[call_key]} times with same arguments. Stop repeating and move on to the next step or provide your final answer.",
+                        "error": f"Tool '{tool_name}' called {_tool_call_counts[call_key]} times with same arguments. Stop repeating and provide your final answer now.",
                     })
                     cols = shutil.get_terminal_size().columns
                     sys.stdout.write(f"\r{' ' * cols}\r")
