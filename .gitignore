@@ -13,7 +13,6 @@ url_shortener/
 telegram_bot/
 tests/
 requirements.txt
-README.md
 DESIGN.md
 run.py
 .env
